@@ -3694,6 +3694,15 @@ export function issueRoutes(
     if (!req.actor.agentId || !req.actor.runId)
       throw crossIssueInfluenceRunContextError();
 
+    // Read current ownership rather than trusting the caller's issue object,
+    // which may predate an assignment change. A null/unassigned issue simply
+    // yields null here and the cap applies as before.
+    const targetIssue = await db
+      .select({ assigneeAgentId: issueRows.assigneeAgentId })
+      .from(issueRows)
+      .where(eq(issueRows.id, issue.id))
+      .then((rows) => rows[0] ?? null);
+
     // The counter transaction locks and validates the persisted run before it
     // derives the source issue. Never trust the API-key run header by itself.
     const decision = await observeCrossIssueInfluence(db, {
@@ -3703,6 +3712,7 @@ export function issueRoutes(
       responsibleUserId: req.actor.onBehalfOfUserId ?? null,
       targetIssueId: issue.id,
       targetIssueIdentifier: issue.identifier ?? null,
+      targetAssigneeAgentId: targetIssue?.assigneeAgentId ?? null,
       kind,
     });
     if (!decision || decision.allowed) return true;

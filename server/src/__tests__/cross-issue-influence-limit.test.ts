@@ -238,4 +238,116 @@ describe("cross-issue influence limit rollout", () => {
       expect.objectContaining({ action: "issue.cross_issue_influence_cap_rejected" }),
     ]);
   });
+  // A bare `heartbeat_timer` run has no source issue, so
+  // the source comparison can never match and every issue write it made spent
+  // the cap — including writes to the very issue routed to that agent. The
+  // assignee short-circuit keeps an agent inside the boundary of its own work.
+  describe("assignee short-circuit for unscoped runs", () => {
+    const AGENT = "33333333-3333-4333-8333-333333333333";
+    const OTHER_AGENT = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+    const noSource = { contextSnapshot: {} };
+
+    it("allows an unscoped run to write to an issue it is the assignee of", async () => {
+      const fake = counterDb(0, noSource);
+
+      await expect(observeCrossIssueInfluence(fake.db as never, {
+        companyId: "22222222-2222-4222-8222-222222222222",
+        runId: "11111111-1111-4111-8111-111111111111",
+        agentId: AGENT,
+        targetIssueId: "55555555-5555-4555-8555-555555555555",
+        targetAssigneeAgentId: AGENT,
+        kind: "comment",
+      })).resolves.toBeNull();
+
+      // Returning null means "in boundary": nothing is counted.
+      expect(fake.inserted).toEqual([]);
+      expect(fake.observedCount).toBe(0);
+    });
+
+    it("still counts an unscoped run writing to an issue assigned to someone else", async () => {
+      const fake = counterDb(0, noSource);
+
+      await expect(observeCrossIssueInfluence(fake.db as never, {
+        companyId: "22222222-2222-4222-8222-222222222222",
+        runId: "11111111-1111-4111-8111-111111111111",
+        agentId: AGENT,
+        targetIssueId: "55555555-5555-4555-8555-555555555555",
+        targetAssigneeAgentId: OTHER_AGENT,
+        kind: "comment",
+      })).resolves.toMatchObject({ count: 1, allowed: true });
+
+      expect(fake.inserted).toHaveLength(1);
+    });
+
+    it("still counts an unscoped run writing to an unassigned issue", async () => {
+      const fake = counterDb(0, noSource);
+
+      await expect(observeCrossIssueInfluence(fake.db as never, {
+        companyId: "22222222-2222-4222-8222-222222222222",
+        runId: "11111111-1111-4111-8111-111111111111",
+        agentId: AGENT,
+        targetIssueId: "55555555-5555-4555-8555-555555555555",
+        targetAssigneeAgentId: null,
+        kind: "update",
+      })).resolves.toMatchObject({ count: 1, allowed: true });
+
+      expect(fake.inserted).toHaveLength(1);
+    });
+
+    it("does not let an unscoped assignee escape the cap once it is exhausted", async () => {
+      const fake = counterDb(CROSS_ISSUE_INFLUENCE_LIMIT, noSource);
+
+      // The assignee's own writes are never counted, so they can never push a
+      // run to the cap — but genuine cross-issue writes still get rejected.
+      await expect(observeCrossIssueInfluence(fake.db as never, {
+        companyId: "22222222-2222-4222-8222-222222222222",
+        runId: "11111111-1111-4111-8111-111111111111",
+        agentId: AGENT,
+        targetIssueId: "55555555-5555-4555-8555-555555555555",
+        targetAssigneeAgentId: OTHER_AGENT,
+        kind: "comment",
+        now: new Date(CROSS_ISSUE_INFLUENCE_ENFORCE_AT),
+      })).resolves.toMatchObject({ allowed: false });
+
+      expect(fake.inserted).toEqual([
+        expect.objectContaining({ action: "issue.cross_issue_influence_cap_rejected" }),
+      ]);
+    });
+
+    it("keeps a source-stamped run on its source issue even when it is not the assignee", async () => {
+      const fake = counterDb(0, {
+        contextSnapshot: { issueId: "55555555-5555-4555-8555-555555555555" },
+      });
+
+      await expect(observeCrossIssueInfluence(fake.db as never, {
+        companyId: "22222222-2222-4222-8222-222222222222",
+        runId: "11111111-1111-4111-8111-111111111111",
+        agentId: AGENT,
+        targetIssueId: "55555555-5555-4555-8555-555555555555",
+        targetAssigneeAgentId: OTHER_AGENT,
+        kind: "comment",
+      })).resolves.toBeNull();
+
+      expect(fake.inserted).toEqual([]);
+    });
+
+    it("does not exempt an assignee from a genuine cross-issue write", async () => {
+      // Source is issue A; the agent is the assignee of issue B. Assigning
+      // yourself a target issue must not buy unlimited influence over others.
+      const fake = counterDb(0, {
+        contextSnapshot: { issueId: "44444444-4444-4444-8444-444444444444" },
+      });
+
+      await expect(observeCrossIssueInfluence(fake.db as never, {
+        companyId: "22222222-2222-4222-8222-222222222222",
+        runId: "11111111-1111-4111-8111-111111111111",
+        agentId: AGENT,
+        targetIssueId: "55555555-5555-4555-8555-555555555555",
+        targetAssigneeAgentId: AGENT,
+        kind: "comment",
+      })).resolves.toMatchObject({ count: 1, allowed: true });
+
+      expect(fake.inserted).toHaveLength(1);
+    });
+  });
 });

@@ -76,6 +76,12 @@ export async function observeCrossIssueInfluence(
     responsibleUserId?: string | null;
     targetIssueId: string;
     targetIssueIdentifier?: string | null;
+    /**
+     * The target issue's current `assigneeAgentId`. Supplied by the route so
+     * the transaction can decide assignee ownership without a second read; it
+     * is only ever compared against the locked run's `agentId`.
+     */
+    targetAssigneeAgentId?: string | null;
     kind: CrossIssueInfluenceKind;
     now?: Date;
   },
@@ -109,12 +115,31 @@ export async function observeCrossIssueInfluence(
       throw crossIssueInfluenceRunContextError();
     }
 
-    // An unscoped run (timer heartbeat with no checked-out issue) has no source
-    // issue, so every issue write it makes is cross-issue by definition and
-    // spends the cap. The locked run row above is the attribution anchor;
-    // rejecting these writes as run-less left live heartbeat runs unable to
-    // comment or update any task at all.
+    // A run attributed to a wake context is bounded by that context's issue.
     const sourceIssueId = readRunSourceIssueId(run.contextSnapshot);
+    // An unscoped run (a `heartbeat_timer` wake with no checked-out issue) has
+    // no source issue at all, so the source comparison below can never match
+    // and every issue write it makes is cross-issue by definition. That is
+    // correct for issues the agent was never given, but it is wrong for the
+    // issue it is the assignee of: that ownership is a first-class
+    // authorization fact on the issue row, not a wake-context coincidence, and
+    // capping it made a bare heartbeat run unable to report on the very tasks
+    // routed to it. Short-circuit here — before the source derivation and
+    // before any counter row is written — so an
+    // assignee's own issue stays inside the run's boundary and uncounted.
+    //
+    // This cannot widen the cap for genuine cross-issue work: the branch only
+    // matches when the target issue's `assigneeAgentId` is this run's own
+    // `agentId`, which was already validated against the locked run row above.
+    // Writing to any other issue still falls through to the counter.
+    if (input.targetAssigneeAgentId && input.targetAssigneeAgentId === run.agentId) {
+      if (sourceIssueId === null || sourceIssueId === input.targetIssueId) {
+        return null;
+      }
+    }
+
+    // Everything else is cross-issue by definition and spends the cap. The
+    // locked run row above is the attribution anchor.
     if (
       sourceIssueId !== null &&
       (sourceIssueId === input.targetIssueId ||

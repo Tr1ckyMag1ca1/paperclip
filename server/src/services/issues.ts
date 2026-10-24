@@ -7635,8 +7635,16 @@ export function issueService(db: Db) {
           return { adopted: null, latest: lockedIssue };
         }
       }
+      // A run row can be terminal (`cancelled`) while its agent body is still
+      // executing — the runtime supersedes the row but the body keeps working.
+      // A terminal actor run may still re-adopt a binding that is *its own*:
+      // that binding was established by this same run, so adopting it back
+      // cannot take the issue away from anybody. A run still may not adopt a
+      // binding owned by a *different* run, so the anti-conflict protection
+      // that stops two live runs from fighting over an issue is unchanged.
+      const actorIsSelf = input.actorRunId === input.expectedCheckoutRunId;
       const actorLive =
-        actorRun && !TERMINAL_HEARTBEAT_RUN_STATUSES.has(actorRun.status);
+        actorRun && (actorIsSelf || !TERMINAL_HEARTBEAT_RUN_STATUSES.has(actorRun.status));
       if (!stale || !actorLive) {
         return { adopted: null, latest: lockedIssue };
       }
@@ -7738,6 +7746,15 @@ export function issueService(db: Db) {
 
   async function clearExecutionRunIfTerminal(
     issueId: string,
+    /**
+     * The acting run, when the caller is already bound to this issue. A run
+     * record can be terminal (`cancelled`) while its agent body is still
+     * executing — the runtime supersedes the row but the body keeps working.
+     * Clearing the actor's *own* binding in that window makes every later
+     * write look like a foreign-owner conflict, so the actor's binding is
+     * never stale with respect to its own request.
+     */
+    actorRunId?: string | null,
   ): Promise<boolean> {
     return db.transaction(async (tx) => {
       await tx.execute(
@@ -7749,6 +7766,7 @@ export function issueService(db: Db) {
         .where(eq(issues.id, issueId))
         .then((rows) => rows[0] ?? null);
       if (!issue?.executionRunId) return false;
+      if (actorRunId && issue.executionRunId === actorRunId) return false;
 
       await tx.execute(
         sql`select ${heartbeatRuns.id} from ${heartbeatRuns} where ${heartbeatRuns.id} = ${issue.executionRunId} for update`,
@@ -7786,7 +7804,12 @@ export function issueService(db: Db) {
   // bundled execution lock cols) when the row's checkoutRunId points at a
   // heartbeat run that is terminal or no longer exists. No assignee/status
   // precondition. Explicit retry claims remain owned by queue-first settlement.
-  async function clearCheckoutRunIfTerminal(issueId: string): Promise<boolean> {
+  // The acting run's own binding is preserved: a terminal run row with a
+  // still-live agent body must not lose the lock that authorizes its write.
+  async function clearCheckoutRunIfTerminal(
+    issueId: string,
+    actorRunId?: string | null,
+  ): Promise<boolean> {
     return db.transaction(async (tx) => {
       await tx.execute(
         sql`select ${issues.id} from ${issues} where ${issues.id} = ${issueId} for update`,
@@ -7802,6 +7825,7 @@ export function issueService(db: Db) {
         .where(eq(issues.id, issueId))
         .then((rows) => rows[0] ?? null);
       if (!issue?.checkoutRunId) return false;
+      if (actorRunId && issue.checkoutRunId === actorRunId) return false;
 
       await tx.execute(
         sql`select ${heartbeatRuns.id} from ${heartbeatRuns} where ${heartbeatRuns.id} = ${issue.checkoutRunId} for update`,
@@ -12005,8 +12029,12 @@ export function issueService(db: Db) {
       actorAgentId: string,
       actorRunId: string | null,
     ) => {
-      await clearExecutionRunIfTerminal(id);
-      await clearCheckoutRunIfTerminal(id);
+      // The acting run's own binding is preserved across the terminal-run
+      // cleanup below. A run row can be terminal while its agent body is
+      // still executing; stripping that binding would make the actor look
+      // like a foreign owner and 409 every write it makes.
+      await clearExecutionRunIfTerminal(id, actorRunId);
+      await clearCheckoutRunIfTerminal(id, actorRunId);
       const loadCurrent = () =>
         db
           .select({
@@ -12130,27 +12158,70 @@ export function issueService(db: Db) {
       if (!latest) throw notFound("Issue not found");
       const resolvedLatest = await resolveOwnership(latest);
       if (resolvedLatest.ownership) return resolvedLatest.ownership;
-      if (resolvedLatest.latest) {
-        throw conflict("Issue run ownership conflict", {
-          issueId: resolvedLatest.latest.id,
-          status: resolvedLatest.latest.status,
-          assigneeAgentId: resolvedLatest.latest.assigneeAgentId,
-          checkoutRunId: resolvedLatest.latest.checkoutRunId,
-          executionRunId: resolvedLatest.latest.executionRunId,
+
+      // The bare `checkoutRunId` / `actorRunId` pair cannot explain *why* they
+      // differ, so an agent reading a 409 cannot tell whether it is its own
+      // terminal run status, a stale foreign owner, or a handoff. Name the
+      // cause instead of making the caller re-send a header that was already
+      // correct.
+      const buildOwnershipConflict = async (row: {
+        id: string;
+        status: string;
+        assigneeAgentId: string | null;
+        checkoutRunId: string | null;
+        executionRunId: string | null;
+      }) => {
+        const actorRun = actorRunId
+          ? await db
+              .select({ status: heartbeatRuns.status })
+              .from(heartbeatRuns)
+              .where(eq(heartbeatRuns.id, actorRunId))
+              .then((rows) => rows[0] ?? null)
+          : null;
+        const actorRunTerminal = Boolean(
+          actorRun && TERMINAL_HEARTBEAT_RUN_STATUSES.has(actorRun.status),
+        );
+        const remediation = actorRunTerminal
+          ? {
+              code: "actor_run_terminal",
+              actorRunStatus: actorRun!.status,
+              message:
+                `Run ${actorRunId} is ${actorRun!.status} but its agent body is still executing. ` +
+                `This issue is not owned by another run; re-checkout the issue to re-bind it to a live run, ` +
+                `or start a new run for the issue before writing.`,
+            }
+          : row.checkoutRunId
+            ? {
+                code: "checkout_owned_by_other_run",
+                message:
+                  `Run ${actorRunId ?? "(none)"} does not own this issue. ` +
+                  `It is checked out by run ${row.checkoutRunId}. ` +
+                  `Do not resend the run-id header; wait for the owning run to finish or release the checkout.`,
+              }
+            : {
+                code: "issue_not_owned_by_actor",
+                message:
+                  `Run ${actorRunId ?? "(none)"} does not own this issue and the issue has no live checkout owner. ` +
+                  `Do not resend the run-id header; check out the issue to bind it to your run first.`,
+              };
+        return conflict("Issue run ownership conflict", {
+          issueId: row.id,
+          status: row.status,
+          assigneeAgentId: row.assigneeAgentId,
+          checkoutRunId: row.checkoutRunId,
+          executionRunId: row.executionRunId,
           actorAgentId,
           actorRunId,
+          actorRunStatus: actorRun?.status ?? null,
+          remediation,
         });
+      };
+
+      if (resolvedLatest.latest) {
+        throw await buildOwnershipConflict(resolvedLatest.latest);
       }
 
-      throw conflict("Issue run ownership conflict", {
-        issueId: latest.id,
-        status: latest.status,
-        assigneeAgentId: latest.assigneeAgentId,
-        checkoutRunId: latest.checkoutRunId,
-        executionRunId: latest.executionRunId,
-        actorAgentId,
-        actorRunId,
-      });
+      throw await buildOwnershipConflict(latest);
     },
 
     release: async (

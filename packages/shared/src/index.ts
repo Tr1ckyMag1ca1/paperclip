@@ -153,6 +153,7 @@ export {
   type IssueWriteDenialContext,
   type IssueWriteDenialCopy,
   type IssueWriteDenialTone,
+  type RunContextRejectionReason,
 } from "./issue-write-denial.js";
 export {
   RESPONSIBLE_USER_DENIAL_CODES,

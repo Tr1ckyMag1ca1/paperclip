@@ -1,7 +1,8 @@
-import { and, count, eq } from "drizzle-orm";
+import { and, count, eq, or } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
-import { activityLog, heartbeatRuns } from "@paperclipai/db";
+import { activityLog, heartbeatRuns, issues } from "@paperclipai/db";
 import { isUuidLike, issueWriteDenialResponse } from "@paperclipai/shared";
+import type { RunContextRejectionReason } from "@paperclipai/shared";
 import { forbidden } from "../errors.js";
 import { logger } from "../middleware/logger.js";
 
@@ -27,10 +28,19 @@ export type CrossIssueInfluenceDecision = {
   enforceAt: string;
 };
 
-export function crossIssueInfluenceRunContextError() {
+export function crossIssueInfluenceRunContextError(
+  reason: RunContextRejectionReason = "run_id_missing",
+) {
   // Copy comes from the shared issue-write denial contract (the open cross-task write design (failure UX))
   // so the agent reading this 403 is told the fix, not just the refusal.
-  const { body } = issueWriteDenialResponse("cross_issue_influence_run_context_required");
+  //
+  // The reason matters: `run_id_missing` is fixed by sending the run-id
+  // header, but `run_id_malformed` and `run_not_found` mean the header was
+  // already present and correct. Telling those callers to resend it sends
+  // them into a no-op loop that burns a whole heartbeat.
+  const { body } = issueWriteDenialResponse("cross_issue_influence_run_context_required", {
+    runContextReason: reason,
+  });
   return forbidden(body.error, body.details);
 }
 
@@ -82,7 +92,7 @@ export async function observeCrossIssueInfluence(
 ): Promise<CrossIssueInfluenceDecision | null> {
   // API-key callers control the run header. Reject malformed UUIDs before the
   // database can turn an untrusted identifier into a PostgreSQL cast error.
-  if (!isUuidLike(input.runId)) throw crossIssueInfluenceRunContextError();
+  if (!isUuidLike(input.runId)) throw crossIssueInfluenceRunContextError("run_id_malformed");
 
   return db.transaction(async (tx) => {
     const run = await tx
@@ -106,7 +116,10 @@ export async function observeCrossIssueInfluence(
       run.companyId !== input.companyId ||
       run.agentId !== input.agentId
     ) {
-      throw crossIssueInfluenceRunContextError();
+      // The run id was well-formed and the header was present — it just does
+      // not match a live run for this company/agent. Resending the same header
+      // cannot fix that, so the copy must not tell the caller to do so.
+      throw crossIssueInfluenceRunContextError("run_not_found");
     }
 
     // An unscoped run (timer heartbeat with no checked-out issue) has no source
@@ -121,6 +134,38 @@ export async function observeCrossIssueInfluence(
         (input.targetIssueIdentifier && sourceIssueId.toUpperCase() === input.targetIssueIdentifier.toUpperCase()))
     ) {
       return null;
+    }
+
+    // A run can be bound to an issue by a checkout rather than by its wake
+    // context. A `heartbeat_timer` wake has no `contextSnapshot.issueId`, so
+    // the snapshot lookup above cannot see a binding the run genuinely owns,
+    // and the guard used to treat every such write as unattributable
+    // (`cross_issue_influence_run_context_required`) even when the run had
+    // checked the target issue out and was its legitimate writer.
+    //
+    // `issues.checkoutRunId` / `issues.executionRunId` are the other half of
+    // the run->issue binding contract: `POST /api/issues/:id/checkout` writes
+    // the caller's run id into both columns. Consult them before the cap so a
+    // run that owns the issue it writes to is attributed as a self-write.
+    //
+    // This only widens the self-write short-circuit. A run that owns *no*
+    // binding to the target issue still falls through to the counter below,
+    // so the per-run cross-issue cap (and the anti-spray backstop it provides)
+    // stays fully intact for genuinely unrelated writes.
+    if (sourceIssueId === null) {
+      const ownedTargetIssue = await tx
+        .select({ id: issues.id })
+        .from(issues)
+        .where(and(
+          eq(issues.id, input.targetIssueId),
+          eq(issues.companyId, input.companyId),
+          or(
+            eq(issues.checkoutRunId, run.id),
+            eq(issues.executionRunId, run.id),
+          ),
+        ))
+        .then((rows) => rows[0] ?? null);
+      if (ownedTargetIssue) return null;
     }
 
     const priorCount = await tx

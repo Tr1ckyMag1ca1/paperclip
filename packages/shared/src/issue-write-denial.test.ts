@@ -86,6 +86,37 @@ describe("describeIssueWriteDenial", () => {
     expect(copy.sanctionedPath).toContain("PAPERCLIP_RUN_ID");
   });
 
+  it("does not tell a caller whose header was already present to resend it", () => {
+    // ALE-2195: the 403 body used to say "send the X-Paperclip-Run-Id header
+    // and retry" for every run-context rejection, including the case where the
+    // header was present, well-formed, and simply matched no live run. Agents
+    // burned a whole heartbeat resending a header that was never the problem.
+    const copy = describeIssueWriteDenial("cross_issue_influence_run_context_required", {
+      runContextReason: "run_not_found",
+    });
+    expect(copy.sanctionedPath).toContain("Resending the same run id will not help");
+    expect(copy.description).toContain("well-formed");
+    // It must not open by telling the caller to send the header and retry —
+    // that is the instruction that sent agents into the no-op loop.
+    expect(copy.sanctionedPath).not.toMatch(/^Send the `X-Paperclip-Run-Id` header/);
+  });
+
+  it("explains a malformed run id without telling the caller to resend it unchanged", () => {
+    const copy = describeIssueWriteDenial("cross_issue_influence_run_context_required", {
+      runContextReason: "run_id_malformed",
+    });
+    expect(copy.sanctionedPath).toContain("not a UUID");
+    expect(copy.description).toContain("not a well-formed identifier");
+  });
+
+  it("keeps the header instruction for a request that carried no run id at all", () => {
+    const copy = describeIssueWriteDenial("cross_issue_influence_run_context_required", {
+      runContextReason: "run_id_missing",
+    });
+    expect(copy.sanctionedPath).toContain("X-Paperclip-Run-Id");
+    expect(copy.sanctionedPath).toContain("PAPERCLIP_RUN_ID");
+  });
+
   it("tells a spoof attempt that the write itself was fine", () => {
     const copy = describeIssueWriteDenial("issue_write_attribution_spoof_rejected", {
       actorLabel: "Fable",

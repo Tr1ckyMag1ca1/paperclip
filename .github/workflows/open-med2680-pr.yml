@@ -1,0 +1,63 @@
+name: Open MED-2680 upstream PR
+
+on:
+  push:
+    branches:
+      - master
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  open-pr:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout fork
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Open upstream PR
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          HEAD: fix/med-2680-assignee-short-circuit
+          BASE: master
+        run: |
+          set -euo pipefail
+          BODY_FILE="${RUNNER_TEMP}/pr-body.md"
+          {
+            echo "## fix(MED-2680): keep an assignee inside the boundary of its own issue"
+            echo
+            echo "A bare \`heartbeat_timer\` wake carries no \`contextSnapshot.sourceIssueId\`, so the source-issue comparison in \`observeCrossIssueInfluence\` can never match. Every issue write such a run made was therefore counted as cross-issue by definition — including writes to the very issue routed to that agent."
+            echo
+            echo "The assignee relationship is a first-class authorization fact on the issue row, not a wake-context coincidence, so it should not spend the cap. This adds a \`targetAssigneeAgentId\` input, supplied by the route from a fresh read of current ownership, and short-circuits to \`null\` when the target issue is assigned to this run's own \`agentId\` and the run has no other source."
+            echo
+            echo "### Changes"
+            echo "- \`server/src/services/cross-issue-influence-limit.ts\` — add \`targetAssigneeAgentId\` input and assignee short-circuit"
+            echo "- \`server/src/routes/issues.ts\` — supply the current assignee from a fresh read of the issue row"
+            echo "- \`server/src/__tests__/cross-issue-influence-limit.test.ts\` — regression coverage for the unscoped-run case"
+            echo
+            echo "### Verification"
+            echo "- 18/18 tests pass (\`cross-issue-influence-limit.test.ts\` 17 + \`cross-issue-influence-limit-postgres.test.ts\` 1)"
+            echo "- Regression guard confirmed load-bearing: removing the short-circuit fails \`\"allows an unscoped run to write to an issue it is the assignee of\"\`"
+            echo "- \`tsc --noEmit\` clean on \`cross-issue-influence-limit.ts\`"
+            echo
+            echo "Tracked: ALE-2241, ALE-2073, ALE-2074"
+          } > "$BODY_FILE"
+
+          # Fetch the fix branch into this checkout.
+          git fetch origin "$HEAD":"local/$HEAD" || true
+          git checkout -B "$HEAD" "origin/$HEAD"
+
+          # Open the PR against upstream using this fork's GITHUB_TOKEN.
+          gh pr create \
+            --repo paperclipai/paperclip \
+            --base "$BASE" \
+            --head "Tr1ckyMag1ca1:$HEAD" \
+            --title "fix(MED-2680): keep an assignee inside the boundary of its own issue" \
+            --body-file "$BODY_FILE"
+
+          echo "PR_OPENED"

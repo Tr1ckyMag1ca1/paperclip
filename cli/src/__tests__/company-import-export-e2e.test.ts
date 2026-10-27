@@ -1,5 +1,6 @@
 import { execFile, spawn } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { createRequire } from "node:module";
 import net from "node:net";
 import os from "node:os";
 import path from "node:path";
@@ -11,6 +12,7 @@ import {
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
 import { createStoredZipArchive } from "./helpers/zip.js";
+import { removeTestHome } from "../../../tests/helpers/remove-test-home.js";
 
 const execFileAsync = promisify(execFile);
 type ServerProcess = ReturnType<typeof spawn>;
@@ -153,6 +155,7 @@ function createServerEnv(
   env.PORT = String(port);
   env.SERVE_UI = "false";
   env.PAPERCLIP_DB_BACKUP_ENABLED = "false";
+  env.PAPERCLIP_DECISION_SIGNING_SECRET = "company-import-export-decision-signing-secret";
   env.HEARTBEAT_SCHEDULER_ENABLED = "false";
   env.PAPERCLIP_MIGRATION_AUTO_APPLY = "true";
   env.PAPERCLIP_UI_DEV_MIDDLEWARE = "false";
@@ -206,6 +209,11 @@ async function api<T>(baseUrl: string, pathname: string, init?: RequestInit): Pr
     throw new Error(`Request failed ${res.status} ${pathname}: ${text}`);
   }
   return text ? JSON.parse(text) as T : (null as T);
+}
+
+function isPortableAgent(agent: { metadata?: Record<string, unknown> | null }) {
+  const marker = agent.metadata?.paperclipBuiltInAgent;
+  return typeof marker !== "object" || marker === null;
 }
 
 async function runCliJson<T>(
@@ -296,8 +304,8 @@ describeEmbeddedPostgres("paperclipai company import/export e2e", () => {
     const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../../..");
     const output = { stdout: [] as string[], stderr: [] as string[] };
     const child = spawn(
-      "pnpm",
-      ["paperclipai", "run", "--config", configPath],
+      process.execPath,
+      ["--import", createRequire(import.meta.url).resolve("tsx"), path.join(repoRoot, "cli/src/index.ts"), "run", "--config", configPath],
       {
         cwd: repoRoot,
         env: createServerEnv(configPath, port, tempDb.connectionString, {
@@ -323,7 +331,7 @@ describeEmbeddedPostgres("paperclipai company import/export e2e", () => {
     await stopServerProcess(serverProcess);
     await tempDb?.cleanup();
     if (tempRoot) {
-      rmSync(tempRoot, { recursive: true, force: true });
+      removeTestHome(tempRoot);
     }
   });
 
@@ -560,7 +568,7 @@ describeEmbeddedPostgres("paperclipai company import/export e2e", () => {
     expect(importedExisting.company.action).toBe("unchanged");
     expect(importedExisting.agents.some((agent) => agent.action === "created")).toBe(true);
 
-    const twiceImportedAgents = await api<Array<{ id: string; name: string }>>(
+    const twiceImportedAgents = await api<Array<{ id: string; name: string; metadata?: Record<string, unknown> | null }>>(
       apiBase,
       `/api/companies/${importedNew.company.id}/agents`,
     );
@@ -573,9 +581,10 @@ describeEmbeddedPostgres("paperclipai company import/export e2e", () => {
       `/api/companies/${importedNew.company.id}/issues`,
     );
     const twiceImportedMatchingIssues = twiceImportedIssues.filter((issue) => issue.title === sourceIssue.title);
+    const twiceImportedPortableAgents = twiceImportedAgents.filter(isPortableAgent);
 
-    expect(twiceImportedAgents).toHaveLength(2);
-    expect(new Set(twiceImportedAgents.map((agent) => agent.name)).size).toBe(2);
+    expect(twiceImportedPortableAgents).toHaveLength(2);
+    expect(new Set(twiceImportedPortableAgents.map((agent) => agent.name)).size).toBe(2);
     expect(twiceImportedProjects).toHaveLength(2);
     expect(twiceImportedMatchingIssues).toHaveLength(2);
     expect(new Set(twiceImportedMatchingIssues.map((issue) => issue.identifier)).size).toBe(2);

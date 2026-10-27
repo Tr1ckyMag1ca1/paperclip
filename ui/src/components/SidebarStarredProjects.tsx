@@ -1,7 +1,7 @@
 import { useCallback, useMemo } from "react";
 import { NavLink, useLocation } from "@/lib/router";
 import { useQuery } from "@tanstack/react-query";
-import { Loader2, LogOut, MoreHorizontal, Star } from "lucide-react";
+import { Lock, Loader2, LogOut, MoreHorizontal, Star } from "lucide-react";
 import { useCompany } from "../context/CompanyContext";
 import { useSidebar } from "../context/SidebarContext";
 import { projectsApi } from "../api/projects";
@@ -63,7 +63,7 @@ export function SidebarStarredProjects() {
     const byId = new Map((projects ?? []).map((project: Project) => [project.id, project]));
     return Array.from(starredIds)
       .map((id) => byId.get(id))
-      .filter((project): project is Project => !!project && !project.archivedAt)
+      .filter((project): project is Project => !!project)
       .sort((left, right) =>
         left.name.localeCompare(right.name, undefined, { sensitivity: "base" }),
       );
@@ -121,14 +121,16 @@ export function SidebarStarredProjects() {
               if (isMobile) setSidebarOpen(false);
             }}
             className={cn(
-              "flex min-w-0 flex-1 items-center gap-2.5 px-3 py-1.5 pl-8 pointer-coarse:py-1 pr-8 text-[13px] font-medium transition-colors",
+              "flex min-w-0 flex-1 items-center gap-2.5 mx-2 rounded-lg px-2 py-1.5 pointer-coarse:py-1 pr-8 text-(length:--text-compact) font-medium transition-colors",
+              !rail && "pl-6",
               isActive
-                ? "bg-accent text-foreground"
-                : "text-foreground/80 hover:bg-accent/50 hover:text-foreground",
+                ? "bg-sidebar-accent text-sidebar-accent-foreground"
+                : "text-foreground/80 hover:bg-sidebar-accent hover:text-sidebar-accent-foreground",
             )}
           >
             <ProjectTile color={project.color ?? null} icon={project.icon ?? null} size="xs" />
             <span className={rail ? SIDEBAR_RAIL_HIDDEN_LABEL : "flex-1 truncate"}>{project.name}</span>
+            {!rail && project.visibility === "private" ? <Lock className="size-3.5 shrink-0 text-muted-foreground" aria-label="Private project" /> : null}
             {!rail && project.pauseReason === "budget" ? (
               <BudgetSidebarMarker title="Project paused by budget" />
             ) : null}
@@ -150,7 +152,7 @@ export function SidebarStarredProjects() {
 
             {!rail && !isMobile ? (
               // Desktop: quiet inline unstar revealed on hover/focus.
-              <span className="absolute right-1 top-1/2 -translate-y-1/2">
+              <span className="absolute right-3 top-1/2 -translate-y-1/2">
                 <StarToggle
                   size="row"
                   quiet
@@ -170,7 +172,7 @@ export function SidebarStarredProjects() {
                   <Button
                     variant="ghost"
                     size="icon-xs"
-                    className="absolute right-1 top-1/2 h-6 w-6 -translate-y-1/2 opacity-100"
+                    className="absolute right-3 top-1/2 h-6 w-6 -translate-y-1/2 opacity-100"
                     aria-label={`Open actions for ${project.name}`}
                   >
                     <MoreHorizontal className="h-3.5 w-3.5" />

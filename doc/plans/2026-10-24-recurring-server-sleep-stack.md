@@ -1,0 +1,337 @@
+# Recurring server work migration stack
+
+Baseline: `785d54636e1c8513ee5503d602daf6a5ee1970d6` (2026-10-24).
+
+The requested outcome is a reviewed PR stack for every remaining recurring server
+work item below. A PR owns one reason for background activity. Split compound
+items into separate PRs as their producer and lifecycle audits identify distinct
+owners. Each PR includes behavior, producer audit, tests, and documentation.
+Do not mark an item done from a timer removal or a green check alone.
+
+## Scope and completion ledger
+
+| ID | Original checklist duty | Required slices / disposition | PR / evidence |
+| --- | --- | --- | --- |
+| 01 | Custom-image setup expiry | Session writes, existing expiry, startup/retry/drain | [#17443](https://github.com/paperclipai/paperclip/pull/17443), merged after CI and passing reviews |
+| 02 | Remaining chat maintenance | Provider runtime discovery; voice reconciliation; milestones; wake notices; interaction continuations; terminal confirmations; GitHub recovery; Teams maintenance, separately by owner | Pending |
+| 03 | Run and task recovery | Orphan runs and active leases; shutdown workspace settlement; scheduled retries; queued runs; stranded assignments; resolved dependencies; task watchdogs; silent-run monitoring; stale locks | Pending |
+| 04 | Decision retention and notifications | Retention deadlines and notification delivery are separate reasons | Pending |
+| 05 | Decision expiry and interrupted effects | Expiry, effect recovery, continuation recovery | Pending |
+| 06 | Tool connection health | Configuration/use activation and defined proactive health deadlines | Pending |
+| 07 | Secret proposals, tool reviews, gateway tokens | Separate expiry/scrub/recovery owners | Secret proposals: [#17446](https://github.com/paperclipai/paperclip/pull/17446), merged; gateway credentials: [#17450](https://github.com/paperclipai/paperclip/pull/17450), merged; pending tool-review expiry: [#17453](https://github.com/paperclipai/paperclip/pull/17453), merged; approved recovery: [#17454](https://github.com/paperclipai/paperclip/pull/17454), merged after current-head CI and both 5/5 reviews; interrupted claims: [#17458](https://github.com/paperclipai/paperclip/pull/17458), merged after current-head CI and both 5/5 reviews; projection: [#17468](https://github.com/paperclipai/paperclip/pull/17468), interaction-link index verified and awaiting fresh CI/review |
+| 08 | GitHub connection events and continuity | Event discovery/replay and credential continuity separately | Pending |
+| 09 | Merged-PR confirmations | Candidate writes, webhook activation where supported, outstanding-candidate fallback | Pending |
+| 10 | External-object refresh | Configuration changes, refresh deadlines, source events | Pending |
+| 11 | Status-card evaluation | Settings/card mutations and evaluation deadlines | Pending |
+| 12 | Plugin scheduled jobs | Registration/update/removal and actual job deadlines | Pending |
+| 13 | Routine, agent-timer and issue-monitor scheduling | Remove periodic wake backstops after complete producer coverage; routine execution-status reconciliation separately | Pending |
+| 14 | Skill-version retention and native-harness backup expiration | Separate retention owners and existing retention guarantees | Pending |
+| 15 | Automatic database backups | Shared scheduling, actual backup deadlines, existing checkpoint contract | Pending |
+| 16 | Aggregate maintenance tick | Retire enabled and disabled branches after all constituent owners migrate | Pending |
+
+## Stack and verification contract
+
+The first PR targets master. Each following PR targets its predecessor branch so
+its diff shows only its own reason. Parent changes must be propagated before
+final verification. Record the exact checked head and base for every PR. All PRs
+must finish with passing checks, fresh 5/5 Greptile review, and no unresolved
+findings. This request does not authorize merging the stack.
+
+Reuse the delivery coordinator, transaction notifications, and shared scheduler.
+Existing durable rows own work; no table per loop. Keep domain/provider behavior
+in its service and wiring in startup. A write signal is not durable truth. Preserve
+outer commit/rollback and uncertain-outcome reconciliation. Audit every supported
+producer, including alternate routes and recovery writers.
+
+For each slice verify applicable empty/configured-idle/history quiet states,
+first real producer, actual deadlines, rollback/outer commit, restart, failures,
+changes during execution, drain/resume, and shutdown. Use real PostgreSQL where
+transaction boundaries matter and controlled providers where external behavior
+is under test. Record failures and subsequent repair evidence.
+
+External-source reconciliation may remain only for a concrete supported obligation
+with a defined cadence and stopping condition, using the shared scheduler. Never
+remove the only missed-event backstop without replacing its recovery contract.
+
+## Boundaries
+
+Cloud sleep eligibility and durable alarm coverage remain conservative. An
+in-process deadline cannot wake a stopped host. Browser traffic, persistent
+connector transport architecture, probes, telemetry/exporter qualification, and
+end-to-end provider suspension are outside this requested recurring-server stack;
+none are claimed solved by these PRs. Required active-operation lease renewals and
+request timeouts remain with their owners.
+
+## Next owner audit: tool reviews
+
+Inspected after gateway credential slice `75332b9641`. The existing
+`sweepActionReviews` combines four reasons that need separate migration slices:
+
+1. Pending review expiry: `status = pending` and saved `expiresAt`.
+2. Approved action recovery: approved rows that still owe execution/settlement.
+3. Interrupted execution: executing rows with the existing ten-minute stale
+   threshold; unknown provider outcomes must remain quarantined, not replayed.
+4. Interaction projection repair: terminal requests whose interaction result
+   does not reflect the authoritative request/invocation state.
+
+The next branch is `codex/sleep-04-tool-review-expiry`. Implementation now separates pending expiry with commit-aware signals and its
+existing deadline. Preserve the other three duties while migrating the first, then
+retire them individually. Keep the public/manual recovery entry point compatible
+or update all callers and tests explicitly; tests currently call the combined
+method to cause expiry.
+
+Producer locations found by the audit:
+
+- `tool-access-policy.ts`: creates pending requests with null signature/expiry.
+- `tool-gateway.ts`: signs pending requests and assigns their one-hour expiry;
+  handles competing-call invalidation, approval/execution transitions, provider
+  outcomes, and sweep settlement. Audit all writes, not just initial insertion.
+- `tool-action-review.ts`: owns a transaction for human resolution.
+- `tool-access/activity/review-queue.ts`: invalidates unsigned/unreadable requests.
+- `issue-thread-interactions.ts`: resolves linked pending/approved requests when
+  their governing card is resolved administratively.
+
+The unsigned-row signing grace is distinct from the saved review expiry. Do not
+invent a new expiry policy while removing the scan. A pending row can be observed
+between insert and signing; expiry workers must not cancel an in-flight producer.
+Keep provider execution outside database transactions. Signals must be registered
+before writes in existing transaction ownership, without wrapping provider calls.
+
+Latest evidence: #17443 has all checks passed and both review threads resolved.
+#17446 at `d41590ac0e` has all checks passed, Greptile 5/5, and no review threads.
+#17450 at `c5c53fc43f` fixes the deadline query cost with bounded indexed lookups
+and an idempotent concurrent session index. Both findings are resolved; fresh
+Greptile is 5/5 and CI is running. Local migration/replay, 47 expiry/startup tests,
+workspace typecheck/build passed. A synthetic 40,000-row PostgreSQL plan reads
+one row from each expiry index. Recheck external state before readiness claims.
+
+Slice 04 now has 11 real-PostgreSQL worker lifecycle tests plus 59 existing
+service tests and 39 startup tests passing (109 total). The initial fixture
+incorrectly treated an argument-summary object as a string. After correction,
+the failure test exposed its invalid expectation of no idle hold during an
+unresolved write; it now checks rollback while retaining the hold. A combined
+run also exposed fixture cleanup ordering: this repository uses ordered hooks,
+so the worker must stop before the outer hook deletes rows. The corrected full
+selection passes. The current implementation adds a partial pending-expiry
+index, applies/replays its migration, and preserves approval-time rejection and
+separate approved/executing/projection recovery. Workspace typecheck/build and all 92 existing gateway acceptance tests also
+passed. The first acceptance command matched no files; the corrected
+`tool-gateway.test.ts` selection passed. Fresh PR CI/review remains required.
+
+
+## Approved-review follow-up repairs (2026-10-26)
+
+Slice 05 preserves the rate slot admitted before a human review. Agent and
+Test-tab foreground/recovery paths reuse only the exact invocation/context and
+unchanged rate-policy admission while rechecking current policy. A one-call
+limit must not reject the same approved operation against its own occupied slot.
+
+Recovery now locks and rereads invocation/request history before dispatch.
+Finished records repair the request without provider replay; executing records
+retain unknown-outcome recovery. Invalid signatures, unusable formal approvals,
+and inconsistent invocation states settle once. Missing signing-key configuration
+and temporary dependencies retain retries. Company mismatches never mutate the
+foreign invocation. No new table or generic HTTP-error discard rule is introduced.
+
+Formal approvals awaiting human input have no recovery cadence. The existing
+approval service publishes commit-aware review notifications for approve/reject
+and cancellation. Its shared record owner retains the decision validation/CAS
+contract; hire decisions remain with their lifecycle owner. Revision/resubmission
+keeps the review parked, and startup rediscovers saved work. Budget approval writes
+belong to budget incidents, not tool-gateway formal reviews. Company deletion
+removes the dependent work. These exclusions come from the producer audit.
+
+Local evidence: the four rate-admission regressions, seven permanent-record
+regressions, and four formal-approval commit/rollback regressions failed before
+their respective repairs. The complete gateway, policy, approval-service and
+signature suites pass (208 tests), and server typechecking passes. Configuration
+failure, company boundaries, concurrent claims, provider-outcome persistence
+failure, restart and paging remain covered. The paging fixture now has independent
+invocations instead of 101 approvals sharing an already-expired invocation.
+Full remote checks and downstream integration verification remain required;
+this is not an all-stack acceptance or deployed-sleep claim.
+
+## Next owner audit: approved tool-action recovery
+
+The next branch is `codex/sleep-05-approved-tool-recovery`, based on pending
+expiry PR #17453 at `ce6a260a83`. Keep this separate from interrupted execution
+and terminal projection repair. The public combined sweep remains compatible.
+
+- `commitToolActionReview` and accepted-interaction inference in the gateway are
+  approved-state producers. Existing notification ownership from slice 04 can
+  carry the new duty without adding another wrapper around callers.
+- Agent execute-on-approve uses an atomic approved-to-executing claim before
+  provider execution. Keep that claim and all current authorization, signed
+  argument, current-target, identity, and issue-state checks in the gateway.
+- Approved history is not uniformly executable. Legacy signed arguments without
+  `executionOnApprove` are deliberately inert. The payload can be encrypted;
+  shared scheduling must not decode it or inspect private provider fields.
+- Board Test-tab invocations are a separate execution origin. The normal fresh
+  approval calls `runApprovedTestInvocation`, but the already-approved branch
+  currently skips test-origin execution. Test execution can leave the request
+  approved while the invocation holds the completed result. Do not treat those
+  completed rows as perpetual unfinished work.
+- Before driving test-origin recovery, establish the same single-execution
+  claim on both foreground and recovery paths. The existing test helper does
+  not claim the request before provider dispatch. Simply invoking it from a
+  new worker would risk duplicate effects during foreground/recovery races.
+- Distinguish saved completed outcomes, never-dispatched approved work, and
+  interrupted execution with unknown outcomes. Known completed provider results
+  must not be converted to unknown-outcome failures because another projection
+  write was interrupted. Retain quarantine for actually uncertain calls.
+- Concrete unresolved approval work may retain a retry; configured idle,
+  terminal invocation history, and deliberately inert legacy approvals must
+  not cause empty recurring scans. Preserve restart reconstruction and all
+  supported producer paths, including transitions that finish an approved row.
+
+This is an audit, not an implementation or readiness claim. Tests must exercise
+real approval producers, foreground/recovery contention, provider failure,
+commit/rollback, legacy inert approvals, completed Test-tab history, and actual
+unfinished Test-tab recovery before the next PR is ready.
+
+Current parent CI note: #17450 at `c5c53fc43f` has Greptile 5/5. Its server shard
+10/12 failed the unchanged login-cleanup consume test waiting for an idle hold.
+All 16 login-cleanup tests passed locally on recheck. The run remains active;
+an attempted single-job rerun was rejected as not rerunnable. Recheck after the
+run finishes before requesting its one justified retry. Do not report it green.
+
+
+Slice 05 implementation now separates approved recovery from the aggregate tick.
+The existing review notification boundary wakes it after outer commit. Legacy
+inert approvals and completed Test-tab history become quiet; unresolved work
+retains a retry. Test-tab foreground and recovery share a claim and atomic outcome
+settlement. No provider call occurs inside that transaction. See
+[approved recovery](../idle-approved-tool-recovery.md). Local service/startup
+verification passes 122 tests, gateway acceptance passes 92, and workspace
+typecheck/build pass. Paging and outcome-failure tests passed again after their
+final strengthening. Full CI/review is not yet complete.
+
+Parent CI follow-up: #17450's completed run was retried once for its unchanged
+login-cleanup timeout after all 16 local tests passed. #17453 has a Runner
+prepared-launch close failure. Seven focused local Runner cases also fail, so
+this is under investigation rather than assumed flaky. No retry of that run has
+been requested. Neither parent is reported green without fresh evidence.
+
+
+Slice 05 is [#17454](https://github.com/paperclipai/paperclip/pull/17454).
+Review identified a real one-shot outcome-write error path. A new regression
+failed before the repair; result persistence now runs outside provider-error
+handling. The repaired head passes 123 service/startup tests, 92 acceptance
+tests, workspace typecheck and build. Fresh CI/review remains required.
+#17450 now has passing checks after its single retry. The local Runner
+reproduction for #17453 was missing the fake-provider binary: its durable state
+showed ENOENT hidden by close failure. After building the fixture all seven
+cases pass; one CI retry is running.
+
+#17453 now has passing checks after its single Runner retry. #17454's initial
+server shard found an old expected approved state for a completed Test-tab call;
+the updated regression requires executed and one provider call. All 469
+tool-access service tests pass after enabling the existing external database
+path independently of embedded support. Its initial browser shard failed during
+unrelated plan-task fixture company deletion with a concurrent activity-log FK
+violation. Inspect fresh-head CI before deciding whether that needs a repair.
+
+
+## Slice 06: interrupted tool executions
+
+Branch `codex/sleep-06-interrupted-tool-recovery` is based on #17454 and includes
+its one-shot outcome-write repair. The next deadline is the minimum executing
+claim timestamp plus the existing ten minutes. The new service locks invocation
+then request, rechecks claim identity, preserves saved terminal outcomes, and
+atomically quarantines unknown outcomes without calling a provider. All claim
+producers and request settlements use the existing review notification boundary.
+A partial index supports the first deadline. The aggregate tick now excludes
+interrupted claims; projection repair remains its own pending slice.
+
+Sixteen new worker cases and the existing service/startup selection pass
+(136 total on the combined head). Workspace typecheck/build and migration checks
+pass. Two fake-clock fixture ordering failures were corrected to wait for real
+settlement while advancing retry time. The combined tool-access run had one
+unchanged connection-archive timeout; it passed in isolation. The full suite
+and gateway acceptance are running separately before readiness is claimed.
+No PR is claimed ready until fresh CI and review pass.
+
+## Next owner audit: tool-review interaction projection
+
+The remaining aggregate tool-review duty selects terminal requests whose
+interaction result does not match the authoritative request state. Recovery
+currently reads up to 100 joined rows. Move this duty to its own transaction-
+notified worker, with retries only while projection debt remains. Do not add
+an outbox table merely to migrate the scan.
+
+Audit the final two direct request writers in the gateway as well as existing
+review helpers, expiry, interruption, and Test-tab outcome settlement. Preserve
+the existing reflection owner: it locks issue/interaction/request, checks the
+current request state before writing the card, then publishes activity and
+requests continuation. A no-op reflection can mean an ownership or lifecycle
+condition, not successful reconciliation. Retained terminal requests with
+already matching cards must be quiet. Unprojectable/mismatched durable state
+must not be silently dropped. Paginate without starving later candidates.
+
+Continuation delivery already has its own coordinator. A projection write is
+not proof that downstream delivery or activity publication completed. Identify
+the exact existing recovery owner before removing any backstop, and keep
+provider/private payload interpretation out of the scheduler.
+
+Final slice-06 local verification: the isolated tool-access rerun passes all
+469 tests, gateway acceptance passes 92, and the combined service/startup
+selection passed 136. All 697 selected tests pass on the combined head. The
+initial concurrent-run timeout is retained above as evidence, not hidden.
+Workspace typecheck/build and migration safety/numbering pass. The first four
+PRs are mergeable and have all checks passed at their recorded heads. #17454
+is mergeable with fresh checks and review in progress at `7a1cf03e62`.
+
+Slice 06 is [#17458](https://github.com/paperclipai/paperclip/pull/17458), head
+`85003a7ac4`, based on #17454. Greptile review was requested and the PR is
+attached to this chat. Slice 05 has fresh Greptile 5/5 at `7a1cf03e62`; CI is
+running with no failure in the latest snapshot. The next branch is
+`codex/sleep-07-tool-review-projection`, based on #17458. No seventh implementation
+or readiness is claimed yet. The full remaining inventory stays in scope.
+
+
+## Slice 07: tool-review interaction projection
+
+The implementation removes the last combined review sweep from the main tick.
+It pages terminal mismatches and retains retries only for actual debt or failures.
+Gateway reflection keeps locks, current-state checks, activity, and continuation
+ownership; concurrent identical repairs do not write twice. The producer audit
+also covers administrative card result replacements, before the mutation in the
+existing transaction. See [projection repair](../idle-tool-review-projection.md).
+
+Twelve new lifecycle cases are included in 148 passing service/startup tests.
+Gateway acceptance passes all 92 tests and workspace typechecking passes. The
+initial missing-state bug and referenced-key fixture failure are recorded in the
+behavior document. Build and additional consumer regressions are running; no
+seventh PR is claimed ready yet.
+
+Historical parent evidence at the initial migration: #17454 at `7a1cf03e62`
+and #17458 at `85003a7ac4` passed the recorded CI matrices and Greptile review.
+Those snapshots preceded their current-head review and landing. The first six
+stack PRs have now merged. The full remaining inventory is still in scope.
+
+Initial slice 07 local verification: 815 selected tests passed, with workspace
+typecheck and build passing. One initial interaction cleanup-hook timeout is recorded in
+the behavior document; the complete isolated suite then passed. Both parent
+PRs #17454 and #17458 now have every check passed and are mergeable, including
+the additional Paperclip Review checks. Full CI/review for slice 07 is next.
+
+
+Slice 07 current integration: master `f6bc653f7f` contains the first six landed
+slices and the independent identity/resume/sidebar performance work. This slice
+adds generated concurrent interaction-link index migration `0386_steady_epoch`
+and retains five schema snapshots. Projection worker passes stop at 500 rows,
+honor abort/drain between rows, and resume past failed or unprojectable pages;
+empty reconstruction clears obsolete cursors. Six real regressions failed before
+the fixes. All 320 integrated gateway/projection/startup/deadline/identity/HTTP
+cases, server types and build pass; 35 independent master files are preserved
+exactly. Current-head CI and Greptile/Ponytail review remain required. Earlier
+case counts above describe the broader selections at their original revisions.
+
+
+Slice 07 follow-up: scoped hints avoid redundant discovery, empty sweeps avoid a
+second candidate read, and unresolved-card retries back off to five minutes.
+Fresh writes reactivate promptly and settlement is quiet. The full affected
+gateway/startup/deadline selection passes 222 cases; server types/build pass.
+The initial invalid one-wake-per-approval assertion and corrected isolated-hint
+measurement are retained in the behavior document. Current-head CI/reviews remain
+required before this slice can merge.

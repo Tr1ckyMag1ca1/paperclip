@@ -1,9 +1,11 @@
+import { agentAvatarUrl } from "@/lib/agent-avatar-url";
+import { resolveAgentAppearance } from "@paperclipai/shared";
 /**
  * Work Timeline — custom-SVG Gantt (board-locked Direction C, PAP-12422).
  *
  * Renders actor rows with concurrency sub-lanes, run bars (no issue IDs on the
  * bar — identity is the thin left colour tab; truncated title shows on hover),
- * human kickoff chips at each bar's leading edge, straight
+ * human kickoff chips at the first matching run's leading edge, straight
  * hover-revealed agent→agent delegation connectors (dashed for retries), an
  * in-progress fade to "now", a hover tooltip, and a full-window mini-map with a
  * draggable brush.
@@ -12,7 +14,6 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { useLocation } from "@/lib/router";
 import type { WorkTimelineActor, WorkTimelineResult } from "@paperclipai/shared";
 import { applyCompanyPrefix, extractCompanyPrefixFromPath } from "@/lib/company-routes";
-import { getAgentIcon } from "@/lib/agent-icons";
 import {
   AXIS_H,
   actorType,
@@ -29,6 +30,11 @@ import {
 
 export type ZoomLevel = "hour" | "day" | "week";
 
+export interface VisibleTimelineWindow {
+  fromMs: number;
+  toMs: number;
+}
+
 const ZOOM_DURATION_MIN: Record<ZoomLevel, number> = {
   hour: 60,
   day: 24 * 60,
@@ -41,6 +47,29 @@ const MIN_MINIMAP_SELECTION_MS = 15 * 60 * 1000;
 
 function plotViewportWidth(viewportWidth: number): number {
   return Math.max(240, viewportWidth - GEOM.gutter - 24);
+}
+
+function clampTime(ms: number, fromMs: number, toMs: number): number {
+  return Math.max(fromMs, Math.min(toMs, ms));
+}
+
+function visibleWindowForScroll(
+  layout: Pick<ReturnType<typeof computeLayout>, "fromMs" | "toMs" | "pxPerMinute">,
+  scrollLeft: number,
+  viewportWidth: number,
+): VisibleTimelineWindow {
+  const plotWidth = plotViewportWidth(viewportWidth);
+  const fromMs = clampTime(
+    layout.fromMs + (scrollLeft / layout.pxPerMinute) * 60000,
+    layout.fromMs,
+    layout.toMs,
+  );
+  const toMs = clampTime(
+    layout.fromMs + ((scrollLeft + plotWidth) / layout.pxPerMinute) * 60000,
+    layout.fromMs,
+    layout.toMs,
+  );
+  return { fromMs, toMs: Math.max(fromMs, toMs) };
 }
 
 export function zoomScaleForLevel(level: ZoomLevel, viewportWidth = DEFAULT_VIEWPORT_W): number {
@@ -154,19 +183,10 @@ function ActorGlyph({
   clipId: string;
 }) {
   if (actor.type === "agent") {
-    const Icon = getAgentIcon(actor.avatar);
-    const size = r > 10 ? 16 : 13;
-    return (
-      <Icon
-        data-testid="timeline-agent-icon"
-        x={cx - size / 2}
-        y={cy - size / 2}
-        width={size}
-        height={size}
-        strokeWidth={2.2}
-        color="var(--color-muted-foreground)"
-      />
-    );
+    const size = r > 10 ? 24 : 16;
+    const appearance = resolveAgentAppearance(actor.appearance, actor.id.replace(/^agent:/, ""));
+    return <image data-testid="timeline-agent-icon" href={agentAvatarUrl(appearance, size, 2)}
+      x={cx - size / 2} y={cy - size / 2} width={size} height={size} preserveAspectRatio="xMidYMid meet" />;
   }
 
   const stroke = "var(--color-foreground)";
@@ -224,6 +244,7 @@ export interface WorkTimelineChartProps {
   zoomScale?: number;
   onZoomScaleChange?: (nextScale: number, nextZoom: ZoomLevel) => void;
   onVisibleRangeLabelChange?: (label: string) => void;
+  onVisibleWindowChange?: (window: VisibleTimelineWindow) => void;
   /** override "now" (tests / stories); defaults to Date.now(). */
   nowMs?: number;
 }
@@ -234,6 +255,7 @@ export function WorkTimelineChart({
   zoomScale,
   onZoomScaleChange,
   onVisibleRangeLabelChange,
+  onVisibleWindowChange,
   nowMs,
 }: WorkTimelineChartProps) {
   const location = useLocation();
@@ -344,6 +366,18 @@ export function WorkTimelineChart({
     onVisibleRangeLabelChange(formatVisibleDurationMinutes(minutes));
   }, [layout.pxPerMinute, onVisibleRangeLabelChange, viewportW]);
 
+  useEffect(() => {
+    if (!onVisibleWindowChange || viewportW <= 0) return;
+    onVisibleWindowChange(visibleWindowForScroll(layout, scrollLeft, viewportW));
+  }, [
+    layout.fromMs,
+    layout.toMs,
+    layout.pxPerMinute,
+    onVisibleWindowChange,
+    scrollLeft,
+    viewportW,
+  ]);
+
   const stepMs = chooseTickStepMs(layout.pxPerMinute);
   const ticks: number[] = [];
   const startTick = Math.ceil(layout.fromMs / stepMs) * stepMs;
@@ -434,7 +468,7 @@ export function WorkTimelineChart({
     <div className="relative">
       <div
         ref={scrollRef}
-        className="max-h-[70vh] overflow-auto"
+        className="max-h-(--sz-70vh) overflow-auto"
         data-testid="work-timeline-scroll"
         onScroll={(e) => {
           setScrollLeft(e.currentTarget.scrollLeft);
@@ -485,7 +519,7 @@ export function WorkTimelineChart({
               );
             })}
 
-          {/* now line — teal "Signal" present marker */}
+          {/* now line — status-blue "Signal" present marker (gallery r2; was teal) */}
           {now >= layout.fromMs && now <= layout.toMs && (
             <line
               x1={layout.gutter + ((now - layout.fromMs) / 60000) * layout.pxPerMinute}
@@ -533,11 +567,8 @@ export function WorkTimelineChart({
             return (
               <g key={`row-${row.actor.id}`}>
                 <ActorGlyph actor={row.actor} cx={26} cy={cy} r={AVATAR_R} clipId={actorGlyphId} />
-                <text x={26 + AVATAR_R + 10} y={cy - 2} fontSize={13} fill="var(--color-foreground)">
+                <text x={26 + AVATAR_R + 10} y={cy + 4} fontSize={13} fill="var(--color-foreground)">
                   {truncate(row.actor.name, 18)}
-                </text>
-                <text x={26 + AVATAR_R + 10} y={cy + 12} fontSize={11} fill="var(--color-muted-foreground)">
-                  {row.actor.type}
                 </text>
 
                 {Array.from({ length: row.laneCount }).map((_, ln) => {
@@ -682,22 +713,8 @@ function ActorGutter({ rows, height }: { rows: ReturnType<typeof computeLayout>[
               opacity={i % 2 ? 0.35 : 1}
             />
             <ActorGlyph actor={row.actor} cx={26} cy={cy} r={AVATAR_R} clipId={actorGlyphId} />
-            <text x={26 + AVATAR_R + 10} y={cy - 2} fontSize={13} fill="var(--color-foreground)">
+            <text x={26 + AVATAR_R + 10} y={cy + 4} fontSize={13} fill="var(--color-foreground)">
               {truncate(row.actor.name, 16)}
-            </text>
-            <text x={26 + AVATAR_R + 10} y={cy + 12} fontSize={11} fill="var(--color-muted-foreground)">
-              {row.actor.type}
-            </text>
-            {/* "Signal" rail: run count + active time, right-aligned in the gutter. */}
-            <text
-              x={GEOM.gutter - 10}
-              y={cy + 11}
-              fontSize={10.5}
-              textAnchor="end"
-              fill="var(--color-muted-foreground)"
-              style={{ fontVariantNumeric: "tabular-nums" }}
-            >
-              {row.runCount}× · {formatDuration(0, row.activeMs)}
             </text>
           </g>
         );
@@ -769,10 +786,11 @@ function Tooltip({ tooltip, now }: { tooltip: TooltipState; now: number }) {
   const left = Math.min(tooltip.x + 14, (typeof window !== "undefined" ? window.innerWidth : 1200) - 300);
   return (
     <div
-      className="pointer-events-none fixed z-50 max-w-[280px] rounded-md border border-foreground bg-card px-2.5 py-2 text-xs shadow-md"
+      // design-allow(card-pattern): floating cursor-follow chart tooltip, not a content card (C5a Run 3)
+      className="pointer-events-none fixed z-50 max-w-(--sz-280px) rounded-md border border-foreground bg-card px-2.5 py-2 text-xs shadow-md"
       style={{ left, top: tooltip.y + 14 }}
     >
-      <div className="text-[13px] font-medium text-foreground">{truncate(title)}</div>
+      <div className="text-(length:--text-compact) font-medium text-foreground">{truncate(title)}</div>
       <div className="mt-0.5 text-muted-foreground">
         {fmtClock(startMs)}–{bar.span.end ? fmtClock(endMs) : "now"} · {formatDuration(startMs, endMs)} ·{" "}
         <span className="font-medium text-foreground">{bar.span.status}</span>
@@ -814,14 +832,12 @@ function MiniMap({
   const rowIndex = new Map(layout.rows.map((r, i) => [r.actor.id, i]));
   const laneH = (H - 2 * pad) / Math.max(1, layout.rows.length);
 
-  const timeAtX = (x: number) => {
-    const ms = layout.fromMs + ((x - layout.gutter) / layout.pxPerMinute) * 60000;
-    return Math.max(layout.fromMs, Math.min(layout.toMs, ms));
-  };
-  const visibleStartMs = timeAtX(scrollLeft + layout.gutter);
-  const visibleEndMs = timeAtX(scrollLeft + layout.gutter + (viewportW || W));
+  const visibleWindow = visibleWindowForScroll(layout, scrollLeft, viewportW || W);
+  const visibleStartMs = visibleWindow.fromMs;
+  const visibleEndMs = visibleWindow.toMs;
   const brushX = mx(visibleStartMs);
   const brushW = Math.max(24, mx(visibleEndMs) - brushX);
+  const handleW = 14;
 
   const clearDocumentDrag = () => {
     documentDragCleanupRef.current?.();
@@ -886,7 +902,7 @@ function MiniMap({
         width={W}
         height={H}
         viewBox={`0 0 ${W} ${H}`}
-        className="block cursor-ew-resize"
+        className="block cursor-grab active:cursor-grabbing"
         onMouseDown={(e) => {
           const el = e.currentTarget;
           seek(e.clientX, el);
@@ -924,27 +940,67 @@ function MiniMap({
           strokeWidth={1.5}
           onMouseDown={(e) => startRangeDrag("move", e)}
         />
-        <rect
-          data-testid="timeline-minimap-left-handle"
-          x={brushX - 3}
+        <MiniMapHandle
+          x={brushX}
           y={1}
-          width={6}
           height={H - 2}
-          fill="var(--color-foreground)"
-          opacity={0.55}
+          width={handleW}
+          testId="timeline-minimap-left-handle"
+          label="Drag left edge to resize visible range"
           onMouseDown={(e) => startRangeDrag("left", e)}
         />
-        <rect
-          data-testid="timeline-minimap-right-handle"
-          x={brushX + brushW - 3}
+        <MiniMapHandle
+          x={brushX + brushW}
           y={1}
-          width={6}
           height={H - 2}
-          fill="var(--color-foreground)"
-          opacity={0.55}
+          width={handleW}
+          testId="timeline-minimap-right-handle"
+          label="Drag right edge to resize visible range"
           onMouseDown={(e) => startRangeDrag("right", e)}
         />
       </svg>
     </div>
+  );
+}
+
+function MiniMapHandle({
+  x,
+  y,
+  width,
+  height,
+  testId,
+  label,
+  onMouseDown,
+}: {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+  testId: string;
+  label: string;
+  onMouseDown: (event: React.MouseEvent<SVGElement>) => void;
+}) {
+  const left = x - width / 2;
+  const gripTop = y + height / 2 - 7;
+  return (
+    <g
+      data-testid={testId}
+      className="cursor-grab active:cursor-grabbing"
+      onMouseDown={onMouseDown}
+    >
+      <title>{label}</title>
+      <rect
+        x={left}
+        y={y}
+        width={width}
+        height={height}
+        rx={3}
+        fill="var(--color-foreground)"
+        opacity={0.16}
+      />
+      <line x1={x - 3} y1={gripTop} x2={x - 3} y2={gripTop + 14} stroke="var(--color-foreground)" strokeWidth={1.5} opacity={0.85} />
+      <line x1={x} y1={gripTop} x2={x} y2={gripTop + 14} stroke="var(--color-foreground)" strokeWidth={1.5} opacity={0.85} />
+      <line x1={x + 3} y1={gripTop} x2={x + 3} y2={gripTop + 14} stroke="var(--color-foreground)" strokeWidth={1.5} opacity={0.85} />
+    </g>
   );
 }

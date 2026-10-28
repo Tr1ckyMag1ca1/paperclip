@@ -7,6 +7,7 @@ import {
   companies,
   createDb,
   heartbeatRuns,
+  issues,
 } from "@paperclipai/db";
 import {
   getEmbeddedPostgresTestSupport,
@@ -31,6 +32,7 @@ describeEmbeddedPostgres("cross-issue influence limit PostgreSQL serialization",
 
   afterEach(async () => {
     await db.delete(activityLog);
+    await db.delete(issues);
     await db.delete(heartbeatRuns);
     await db.delete(agents);
     await db.delete(companies);
@@ -111,6 +113,281 @@ describeEmbeddedPostgres("cross-issue influence limit PostgreSQL serialization",
       .from(activityLog)
       .where(and(eq(activityLog.companyId, companyId), eq(activityLog.runId, runId)));
     expect(recorded.filter((row) => row.action === "issue.cross_issue_influence_observed")).toHaveLength(20);
+    expect(recorded.filter((row) => row.action === "issue.cross_issue_influence_cap_rejected")).toHaveLength(1);
+  });
+
+  // ALE-2195: the run->issue binding fallback, against a real database.
+  //
+  // A `heartbeat_timer` wake carries no `contextSnapshot.issueId`, so the
+  // snapshot lookup cannot see the binding a checkout establishes in
+  // `issues.checkoutRunId` / `issues.executionRunId`. The unit test stubs the
+  // DB; this one drives the actual SQL so the `or(checkoutRunId, executionRunId)`
+  // predicate is proven against Postgres, not against a mock's shape.
+  it("treats an unscoped run that owns the target issue by checkout as a self-write", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const runId = randomUUID();
+    const targetIssueId = randomUUID();
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `C${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      defaultResponsibleUserId: "board-user",
+    });
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "Timer Coder",
+      role: "engineer",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    // A bare timer wake: no issueId in the context snapshot.
+    await db.insert(heartbeatRuns).values({
+      id: runId,
+      companyId,
+      agentId,
+      status: "running",
+      responsibleUserId: "board-user",
+      contextSnapshot: {},
+    });
+    // The checkout binding the guard has to consult.
+    await db.insert(issues).values({
+      id: targetIssueId,
+      companyId,
+      title: "Checked out by the timer run",
+      status: "in_progress",
+      checkoutRunId: runId,
+      executionRunId: runId,
+    });
+
+    const decision = await observeCrossIssueInfluence(db, {
+      companyId,
+      runId,
+      agentId,
+      targetIssueId,
+      targetIssueIdentifier: "CAP-1",
+      kind: "update",
+      now: CROSS_ISSUE_INFLUENCE_ENFORCE_AT,
+    });
+
+    // Self-write: no counter row, no decision.
+    expect(decision).toBeNull();
+    const recorded = await db
+      .select({ action: activityLog.action })
+      .from(activityLog)
+      .where(and(eq(activityLog.companyId, companyId), eq(activityLog.runId, runId)));
+    expect(recorded).toHaveLength(0);
+  });
+
+  it("attributes a terminal acting run that still owns the issue by checkout", async () => {
+    // A run row can be terminal (`cancelled`) while its agent body is still
+    // executing — the runtime supersedes the row but the body keeps working.
+    // `clearCheckoutRunIfTerminal` preserves the *acting* run's own binding
+    // across that cleanup (server/src/services/issues.ts:7820), so the binding
+    // the guard needs is still there when the guard runs. This is the exact
+    // shape the CoS measured on 2026-10-24: a cancelled run whose writes were
+    // charged against the cross-issue budget for an issue it had checked out.
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const runId = randomUUID();
+    const targetIssueId = randomUUID();
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `C${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      defaultResponsibleUserId: "board-user",
+    });
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "Timer Coder",
+      role: "engineer",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    await db.insert(heartbeatRuns).values({
+      id: runId,
+      companyId,
+      agentId,
+      status: "cancelled",
+      responsibleUserId: "board-user",
+      contextSnapshot: {},
+    });
+    await db.insert(issues).values({
+      id: targetIssueId,
+      companyId,
+      title: "Checked out by a run whose row went terminal",
+      status: "in_progress",
+      checkoutRunId: runId,
+      executionRunId: runId,
+    });
+
+    const decision = await observeCrossIssueInfluence(db, {
+      companyId,
+      runId,
+      agentId,
+      targetIssueId,
+      targetIssueIdentifier: "CAP-4",
+      kind: "update",
+      now: CROSS_ISSUE_INFLUENCE_ENFORCE_AT,
+    });
+
+    expect(decision).toBeNull();
+    const recorded = await db
+      .select({ action: activityLog.action })
+      .from(activityLog)
+      .where(and(eq(activityLog.companyId, companyId), eq(activityLog.runId, runId)));
+    expect(recorded).toHaveLength(0);
+  });
+
+  it("still charges the cap for an unscoped run that owns a different issue", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const runId = randomUUID();
+    const ownedIssueId = randomUUID();
+    const targetIssueId = randomUUID();
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `C${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      defaultResponsibleUserId: "board-user",
+    });
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "Timer Coder",
+      role: "engineer",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    await db.insert(heartbeatRuns).values({
+      id: runId,
+      companyId,
+      agentId,
+      status: "running",
+      responsibleUserId: "board-user",
+      contextSnapshot: {},
+    });
+    await db.insert(issues).values({
+      id: ownedIssueId,
+      companyId,
+      title: "The issue this run owns",
+      status: "in_progress",
+      checkoutRunId: runId,
+      executionRunId: runId,
+    });
+    await db.insert(issues).values({
+      id: targetIssueId,
+      companyId,
+      title: "An unrelated issue the run is spraying at",
+      status: "todo",
+    });
+
+    const decision = await observeCrossIssueInfluence(db, {
+      companyId,
+      runId,
+      agentId,
+      targetIssueId,
+      targetIssueIdentifier: "CAP-2",
+      kind: "comment",
+      now: CROSS_ISSUE_INFLUENCE_ENFORCE_AT,
+    });
+
+    // The fallback only relaxes the rule for the issue the run owns. A write to
+    // any other issue still spends the shared per-run budget.
+    expect(decision).toMatchObject({ allowed: true, count: 1 });
+    const recorded = await db
+      .select({ action: activityLog.action })
+      .from(activityLog)
+      .where(and(eq(activityLog.companyId, companyId), eq(activityLog.runId, runId)));
+    expect(recorded.filter((row) => row.action === "issue.cross_issue_influence_observed")).toHaveLength(1);
+  });
+
+  it("keeps the 429 cap enforced for an unscoped run that owns the target issue", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const runId = randomUUID();
+    const targetIssueId = randomUUID();
+    const otherIssueId = randomUUID();
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `C${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      defaultResponsibleUserId: "board-user",
+    });
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "Timer Coder",
+      role: "engineer",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    await db.insert(heartbeatRuns).values({
+      id: runId,
+      companyId,
+      agentId,
+      status: "running",
+      responsibleUserId: "board-user",
+      contextSnapshot: {},
+    });
+    await db.insert(issues).values({
+      id: targetIssueId,
+      companyId,
+      title: "Checked out by the timer run",
+      status: "in_progress",
+      checkoutRunId: runId,
+      executionRunId: runId,
+    });
+    await db.insert(issues).values({
+      id: otherIssueId,
+      companyId,
+      title: "Another issue",
+      status: "todo",
+    });
+    // The budget is already spent.
+    await db.insert(activityLog).values(
+      Array.from({ length: 20 }, () => ({
+        companyId,
+        actorType: "agent" as const,
+        actorId: agentId,
+        agentId,
+        runId,
+        action: "issue.cross_issue_influence_observed",
+        entityType: "issue",
+        entityId: otherIssueId,
+      })),
+    );
+
+    const decision = await observeCrossIssueInfluence(db, {
+      companyId,
+      runId,
+      agentId,
+      targetIssueId: otherIssueId,
+      targetIssueIdentifier: "CAP-3",
+      kind: "comment",
+      now: CROSS_ISSUE_INFLUENCE_ENFORCE_AT,
+    });
+
+    // The cap is a designed safety backstop, not a bug: it must still bite.
+    expect(decision).toMatchObject({ allowed: false, count: 21 });
+    const recorded = await db
+      .select({ action: activityLog.action })
+      .from(activityLog)
+      .where(and(eq(activityLog.companyId, companyId), eq(activityLog.runId, runId)));
     expect(recorded.filter((row) => row.action === "issue.cross_issue_influence_cap_rejected")).toHaveLength(1);
   });
 });

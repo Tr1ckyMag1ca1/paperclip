@@ -75,7 +75,30 @@ export interface IssueWriteDenialContext {
   count?: number | null;
   /** ISO timestamp at which log-only rollout becomes enforcement. */
   enforceAt?: string | null;
+  /**
+   * Why the run context was rejected. `cross_issue_influence_run_context_required`
+   * fires for three different situations, and only one of them is fixed by
+   * sending the run-id header — the copy has to tell them apart or it sends
+   * agents on a pointless resend loop.
+   */
+  runContextReason?: RunContextRejectionReason | null;
 }
+
+/**
+ * Why a write could not be attributed to a heartbeat run.
+ *
+ * - `run_id_missing` — the request carried no run id at all. Sending the
+ *   `X-Paperclip-Run-Id` header is the fix.
+ * - `run_id_malformed` — the run id was not a UUID. Resending the same value
+ *   cannot help.
+ * - `run_not_found` — the run id was well-formed and present but no run row
+ *   matched it (or it belonged to another company/agent). Resending the same
+ *   header cannot help; the run has to exist first.
+ */
+export type RunContextRejectionReason =
+  | "run_id_missing"
+  | "run_id_malformed"
+  | "run_not_found";
 
 export function isIssueWriteDenialCode(
   code: string | null | undefined,
@@ -244,23 +267,64 @@ export function describeIssueWriteDenial(
       };
     }
 
-    case "cross_issue_influence_run_context_required":
+    case "cross_issue_influence_run_context_required": {
+      const reason = context.runContextReason ?? "run_id_missing";
+      // Only the "no run id at all" case is fixed by sending the header. The
+      // other two mean the header was already present and correct, so telling
+      // the caller to resend it burns a whole heartbeat on a no-op.
+      if (reason === "run_id_missing") {
+        return {
+          code,
+          status: 403,
+          tone: "boundary",
+          boundary: "Heartbeat run context",
+          title: "Cross-issue writes need a run to attribute them to",
+          description:
+            `Every agent comment and task update is attributed to a heartbeat run so the ` +
+            `cross-issue cap can be counted and the audit trail can name who acted for whom. ` +
+            `This request arrived without a run id, so it could not be contained.`,
+          whoCanAct: `${actor}, once the request carries its own run id.`,
+          sanctionedPath:
+            `Send the \`X-Paperclip-Run-Id\` header with your current run (\`$PAPERCLIP_RUN_ID\`) ` +
+            `and retry.`,
+        };
+      }
+      if (reason === "run_id_malformed") {
+        return {
+          code,
+          status: 403,
+          tone: "boundary",
+          boundary: "Heartbeat run context",
+          title: "This run id is not a usable run reference",
+          description:
+            `Every agent comment and task update is attributed to a heartbeat run so the ` +
+            `cross-issue cap can be counted and the audit trail can name who acted for whom. ` +
+            `The run id on this request was not a well-formed identifier, so it could not be ` +
+            `matched to a run.`,
+          whoCanAct: `${actor}, once the request carries a valid run id.`,
+          sanctionedPath:
+            `Send the \`X-Paperclip-Run-Id\` header with the UUID from \`$PAPERCLIP_RUN_ID\` — ` +
+            `the value that was sent was not a UUID, so resending it unchanged will not help.`,
+        };
+      }
       return {
         code,
         status: 403,
         tone: "boundary",
         boundary: "Heartbeat run context",
-        title: "Cross-issue writes need a run to attribute them to",
+        title: "This run id does not match a live run",
         description:
           `Every agent comment and task update is attributed to a heartbeat run so the ` +
           `cross-issue cap can be counted and the audit trail can name who acted for whom. ` +
-          `This request arrived without a valid run, so it could not be contained.`,
-        whoCanAct: `${actor}, once the request carries its own run id.`,
+          `The run id on this request was well-formed, but no live run matched it for this ` +
+          `company and agent — the run has already ended, or the id belongs to a different run.`,
+        whoCanAct: `${actor}, on a fresh heartbeat run.`,
         sanctionedPath:
-          `Send the \`X-Paperclip-Run-Id\` header with your current run (\`$PAPERCLIP_RUN_ID\`) ` +
-          `and retry.`,
-
+          `Resending the same run id will not help — it was accepted and simply no longer ` +
+          `matches a live run. Start a new heartbeat run and send that run's ` +
+          `\`X-Paperclip-Run-Id\` header (\`$PAPERCLIP_RUN_ID\`) instead.`,
       };
+    }
 
     case "issue_write_attribution_spoof_rejected":
       return {

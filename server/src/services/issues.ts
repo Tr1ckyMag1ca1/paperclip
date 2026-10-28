@@ -1,6 +1,6 @@
 import { Buffer } from "node:buffer";
 import { createHash, randomUUID } from "node:crypto";
-import { and, asc, desc, eq, gt, gte, inArray, isNull, like, lt, ne, notInArray, or, sql, type SQL } from "drizzle-orm";
+import { and, asc, desc, eq, gt, gte, inArray, isNotNull, isNull, like, lt, ne, notInArray, or, sql, type SQL } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
   activityLog,
@@ -338,6 +338,7 @@ function buildPreRealizationExecutionWorkspaceSettings(raw: unknown): Record<str
       type: settings.workspaceStrategy.type,
       ...(settings.workspaceStrategy.baseRef ? { baseRef: settings.workspaceStrategy.baseRef } : {}),
       ...(settings.workspaceStrategy.branchTemplate ? { branchTemplate: settings.workspaceStrategy.branchTemplate } : {}),
+      ...(settings.workspaceStrategy.existingBranch ? { existingBranch: settings.workspaceStrategy.existingBranch } : {}),
       ...(settings.workspaceStrategy.worktreeParentDir ? { worktreeParentDir: settings.workspaceStrategy.worktreeParentDir } : {}),
       ...(settings.workspaceStrategy.provisionCommand ? { provisionCommand: settings.workspaceStrategy.provisionCommand } : {}),
       ...(settings.workspaceStrategy.runtimeProvisionCommand
@@ -2553,8 +2554,22 @@ async function listIssueBlockerAttentionMap(
       explicitWaitingIssueIds.add(parsed.leafIssueId);
     }
 
-    const recoveryActionRows: Array<{ sourceIssueId: string }> = await dbOrTx
-      .select({ sourceIssueId: issueRecoveryActions.sourceIssueId })
+    const recoveryActionRows: Array<{
+      id: string;
+      sourceIssueId: string;
+      status: string;
+      ownerType: string;
+      ownerAgentId: string | null;
+      ownerUserId: string | null;
+    }> = await dbOrTx
+      .select({
+        id: issueRecoveryActions.id,
+        sourceIssueId: issueRecoveryActions.sourceIssueId,
+        status: issueRecoveryActions.status,
+        ownerType: issueRecoveryActions.ownerType,
+        ownerAgentId: issueRecoveryActions.ownerAgentId,
+        ownerUserId: issueRecoveryActions.ownerUserId,
+      })
       .from(issueRecoveryActions)
       .where(
         and(
@@ -2563,7 +2578,38 @@ async function listIssueBlockerAttentionMap(
           inArray(issueRecoveryActions.sourceIssueId, explicitWaitCandidateIds),
         ),
       );
-    for (const row of recoveryActionRows) explicitWaitingIssueIds.add(row.sourceIssueId);
+    const recoveryActionIds = recoveryActionRows.map((row) => row.id);
+    const liveRecoveryActionIds = new Set<string>();
+    for (const chunk of chunkList(recoveryActionIds, ISSUE_LIST_RELATED_QUERY_CHUNK_SIZE)) {
+      const [runRows, wakeRows] = await Promise.all([
+        dbOrTx
+          .select({ recoveryActionId: sql<string | null>`${heartbeatRuns.contextSnapshot} ->> 'recoveryActionId'` })
+          .from(heartbeatRuns)
+          .where(and(
+            eq(heartbeatRuns.companyId, companyId),
+            inArray(heartbeatRuns.status, BLOCKER_ATTENTION_ACTIVE_RUN_STATUSES),
+            inArray(sql<string>`${heartbeatRuns.contextSnapshot} ->> 'recoveryActionId'`, chunk),
+          )),
+        dbOrTx
+          .select({ recoveryActionId: sql<string | null>`${agentWakeupRequests.payload} ->> 'recoveryActionId'` })
+          .from(agentWakeupRequests)
+          .where(and(
+            eq(agentWakeupRequests.companyId, companyId),
+            inArray(agentWakeupRequests.status, BLOCKER_ATTENTION_ACTIVE_WAKE_STATUSES),
+            inArray(sql<string>`${agentWakeupRequests.payload} ->> 'recoveryActionId'`, chunk),
+          )),
+      ]);
+      for (const row of [...runRows, ...wakeRows]) {
+        if (row.recoveryActionId) liveRecoveryActionIds.add(row.recoveryActionId);
+      }
+    }
+    for (const row of recoveryActionRows) {
+      const healthy =
+        (row.status === "escalated" && row.ownerType === "board") ||
+        Boolean(row.ownerUserId) ||
+        (Boolean(row.ownerAgentId) && liveRecoveryActionIds.has(row.id));
+      if (healthy) explicitWaitingIssueIds.add(row.sourceIssueId);
+    }
   }
 
   const agentRows: IssueBlockerAttentionAgentRow[] = agentIds.size > 0
@@ -2708,7 +2754,12 @@ async function listIssueBlockerAttentionMap(
     if (seen.has(nodeId)) return false;
     const node = nodesById.get(nodeId);
     if (!node || node.companyId !== companyId) return false;
-    if (node.status === "in_progress" || activeIssueIds.has(node.id)) return true;
+    if (
+      node.status === "in_progress" ||
+      activeIssueIds.has(node.id) ||
+      explicitWaitingIssueIds.has(node.id) ||
+      Boolean(node.assigneeUserId)
+    ) return true;
 
     const nextSeen = new Set(seen);
     nextSeen.add(nodeId);
@@ -3145,7 +3196,15 @@ const issueListSelect = {
       )
     END
   `,
+  descriptionTruncated: sql<boolean>`
+    CASE
+      WHEN ${issues.description} IS NULL THEN false
+      ELSE length(${issues.description}) > ${ISSUE_LIST_DESCRIPTION_MAX_CHARS}
+    END
+  `,
   status: issues.status,
+  statusVersion: issues.statusVersion,
+  lastStatusDecisionId: issues.lastStatusDecisionId,
   workMode: issues.workMode,
   harnessKind: issues.harnessKind,
   priority: issues.priority,
@@ -4419,9 +4478,18 @@ export function issueService(db: Db) {
     return enriched;
   }
 
-  async function getCurrentScheduledRetryForIssue(issueId: string, companyId: string): Promise<IssueScheduledRetryRow | null> {
-    const row = await db
+  async function getCurrentScheduledRetriesForIssues(
+    issueIds: string[],
+    companyId: string,
+    dbOrTx: DbReader = db,
+  ): Promise<Map<string, IssueScheduledRetryRow>> {
+    const uniqueIssueIds = [...new Set(issueIds)];
+    if (uniqueIssueIds.length === 0) return new Map();
+
+    const contextIssueId = sql<string>`${heartbeatRuns.contextSnapshot} ->> 'issueId'`;
+    const rows = await dbOrTx
       .select({
+        issueId: contextIssueId,
         runId: heartbeatRuns.id,
         status: heartbeatRuns.status,
         agentId: heartbeatRuns.agentId,
@@ -4438,15 +4506,35 @@ export function issueService(db: Db) {
       .where(
         and(
           eq(heartbeatRuns.companyId, companyId),
-          eq(heartbeatRuns.status, "scheduled_retry"),
-          sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${issueId}`,
+          inArray(heartbeatRuns.status, ["scheduled_retry", "queued", "running"]),
+          isNotNull(heartbeatRuns.scheduledRetryReason),
+          inArray(contextIssueId, uniqueIssueIds),
         ),
       )
-      .orderBy(asc(heartbeatRuns.scheduledRetryAt), asc(heartbeatRuns.createdAt), asc(heartbeatRuns.id))
-      .limit(1)
-      .then((rows) => rows[0] ?? null);
+      .orderBy(
+        sql`case ${heartbeatRuns.status}
+          when 'running' then 0
+          when 'queued' then 1
+          else 2
+        end`,
+        asc(heartbeatRuns.scheduledRetryAt),
+        asc(heartbeatRuns.createdAt),
+        asc(heartbeatRuns.id),
+      );
 
-    return row ? { ...row, status: "scheduled_retry" } : null;
+    const currentByIssueId = new Map<string, IssueScheduledRetryRow>();
+    for (const row of rows) {
+      if (currentByIssueId.has(row.issueId)) continue;
+      const status = row.status;
+      if (status !== "scheduled_retry" && status !== "queued" && status !== "running") continue;
+      currentByIssueId.set(row.issueId, { ...row, status });
+    }
+    return currentByIssueId;
+  }
+
+  async function getCurrentScheduledRetryForIssue(issueId: string, companyId: string): Promise<IssueScheduledRetryRow | null> {
+    const currentByIssueId = await getCurrentScheduledRetriesForIssues([issueId], companyId);
+    return currentByIssueId.get(issueId) ?? null;
   }
 
   function deriveIssueCommentAuthorType(comment: {
@@ -4978,6 +5066,24 @@ export function issueService(db: Db) {
       relations.blocks.sort((a, b) => a.title.localeCompare(b.title));
     }
 
+    const relationSummaries: IssueRelationIssueSummary[] = [];
+    const collectRelationSummary = (summary: IssueRelationIssueSummary) => {
+      relationSummaries.push(summary);
+      for (const terminal of summary.terminalBlockers ?? []) collectRelationSummary(terminal);
+    };
+    for (const relations of empty.values()) {
+      for (const blocker of relations.blockedBy) collectRelationSummary(blocker);
+      for (const blocking of relations.blocks) collectRelationSummary(blocking);
+    }
+    const scheduledRetryByIssueId = await getCurrentScheduledRetriesForIssues(
+      relationSummaries.map((summary) => summary.id),
+      companyId,
+      dbOrTx,
+    );
+    for (const summary of relationSummaries) {
+      summary.scheduledRetry = scheduledRetryByIssueId.get(summary.id) ?? null;
+    }
+
     return empty;
   }
 
@@ -5146,7 +5252,16 @@ export function issueService(db: Db) {
           .then((rows) => rows[0] ?? null),
       ]);
       const stale = !existingRun || TERMINAL_HEARTBEAT_RUN_STATUSES.has(existingRun.status);
-      const actorLive = actorRun && !TERMINAL_HEARTBEAT_RUN_STATUSES.has(actorRun.status);
+      // A run row can be terminal (`cancelled`) while its agent body is still
+      // executing — the runtime supersedes the row but the body keeps working.
+      // A terminal actor run may still re-adopt a binding that is *its own*:
+      // that binding was established by this same run, so adopting it back
+      // cannot take the issue away from anybody. A run still may not adopt a
+      // binding owned by a *different* run, so the anti-conflict protection
+      // that stops two live runs from fighting over an issue is unchanged.
+      const actorIsSelf = input.actorRunId === input.expectedCheckoutRunId;
+      const actorLive =
+        actorRun && (actorIsSelf || !TERMINAL_HEARTBEAT_RUN_STATUSES.has(actorRun.status));
       if (!stale || !actorLive) {
         return { adopted: null, latest: lockedIssue };
       }
@@ -5242,7 +5357,18 @@ export function issueService(db: Db) {
     });
   }
 
-  async function clearExecutionRunIfTerminal(issueId: string): Promise<boolean> {
+  async function clearExecutionRunIfTerminal(
+    issueId: string,
+    /**
+     * The acting run, when the caller is already bound to this issue. A run
+     * record can be terminal (`cancelled`) while its agent body is still
+     * executing — the runtime supersedes the row but the body keeps working.
+     * Clearing the actor's *own* binding in that window makes every later
+     * write look like a foreign-owner conflict, so the actor's binding is
+     * never stale with respect to its own request.
+     */
+    actorRunId?: string | null,
+  ): Promise<boolean> {
     return db.transaction(async (tx) => {
       await tx.execute(
         sql`select ${issues.id} from ${issues} where ${issues.id} = ${issueId} for update`,
@@ -5253,6 +5379,7 @@ export function issueService(db: Db) {
         .where(eq(issues.id, issueId))
         .then((rows) => rows[0] ?? null);
       if (!issue?.executionRunId) return false;
+      if (actorRunId && issue.executionRunId === actorRunId) return false;
 
       await tx.execute(
         sql`select ${heartbeatRuns.id} from ${heartbeatRuns} where ${heartbeatRuns.id} = ${issue.executionRunId} for update`,
@@ -5288,9 +5415,13 @@ export function issueService(db: Db) {
   // Symmetric to clearExecutionRunIfTerminal. Clears checkoutRunId (and the
   // bundled execution lock cols) when the row's checkoutRunId points at a
   // heartbeat run that is terminal or no longer exists. No assignee/status
-  // precondition: a terminal run holds no real claim regardless of who is
-  // assigned or what status the issue is currently in.
-  async function clearCheckoutRunIfTerminal(issueId: string): Promise<boolean> {
+  // precondition. Explicit retry claims remain owned by queue-first settlement.
+  // The acting run's own binding is preserved: a terminal run row with a
+  // still-live agent body must not lose the lock that authorizes its write.
+  async function clearCheckoutRunIfTerminal(
+    issueId: string,
+    actorRunId?: string | null,
+  ): Promise<boolean> {
     return db.transaction(async (tx) => {
       await tx.execute(
         sql`select ${issues.id} from ${issues} where ${issues.id} = ${issueId} for update`,
@@ -5301,6 +5432,7 @@ export function issueService(db: Db) {
         .where(eq(issues.id, issueId))
         .then((rows) => rows[0] ?? null);
       if (!issue?.checkoutRunId) return false;
+      if (actorRunId && issue.checkoutRunId === actorRunId) return false;
 
       await tx.execute(
         sql`select ${heartbeatRuns.id} from ${heartbeatRuns} where ${heartbeatRuns.id} = ${issue.checkoutRunId} for update`,
@@ -6467,6 +6599,7 @@ export function issueService(db: Db) {
           id: issues.id,
           assigneeAgentId: issues.assigneeAgentId,
           status: issues.status,
+          blockedTransitionAt: issues.blockedTransitionAt,
         })
         .from(issueRelations)
         .innerJoin(issues, eq(issueRelations.relatedIssueId, issues.id))
@@ -6506,6 +6639,7 @@ export function issueService(db: Db) {
           id: candidate.id,
           assigneeAgentId: candidate.assigneeAgentId!,
           blockerIssueIds: readiness.blockerIssueIds,
+          blockedTransitionAt: candidate.blockedTransitionAt,
         }));
     },
 
@@ -8237,9 +8371,17 @@ export function issueService(db: Db) {
       });
     },
 
-    assertCheckoutOwner: async (id: string, actorAgentId: string, actorRunId: string | null) => {
-      await clearExecutionRunIfTerminal(id);
-      await clearCheckoutRunIfTerminal(id);
+    assertCheckoutOwner: async (
+      id: string,
+      actorAgentId: string,
+      actorRunId: string | null,
+    ) => {
+      // The acting run's own binding is preserved across the terminal-run
+      // cleanup below. A run row can be terminal while its agent body is
+      // still executing; stripping that binding would make the actor look
+      // like a foreign owner and 409 every write it makes.
+      await clearExecutionRunIfTerminal(id, actorRunId);
+      await clearCheckoutRunIfTerminal(id, actorRunId);
       const loadCurrent = () =>
         db
           .select({
@@ -8358,27 +8500,70 @@ export function issueService(db: Db) {
       if (!latest) throw notFound("Issue not found");
       const resolvedLatest = await resolveOwnership(latest);
       if (resolvedLatest.ownership) return resolvedLatest.ownership;
-      if (resolvedLatest.latest) {
-        throw conflict("Issue run ownership conflict", {
-          issueId: resolvedLatest.latest.id,
-          status: resolvedLatest.latest.status,
-          assigneeAgentId: resolvedLatest.latest.assigneeAgentId,
-          checkoutRunId: resolvedLatest.latest.checkoutRunId,
-          executionRunId: resolvedLatest.latest.executionRunId,
+
+      // The bare `checkoutRunId` / `actorRunId` pair cannot explain *why* they
+      // differ, so an agent reading a 409 cannot tell whether it is its own
+      // terminal run status, a stale foreign owner, or a handoff. Name the
+      // cause instead of making the caller re-send a header that was already
+      // correct.
+      const buildOwnershipConflict = async (row: {
+        id: string;
+        status: string;
+        assigneeAgentId: string | null;
+        checkoutRunId: string | null;
+        executionRunId: string | null;
+      }) => {
+        const actorRun = actorRunId
+          ? await db
+              .select({ status: heartbeatRuns.status })
+              .from(heartbeatRuns)
+              .where(eq(heartbeatRuns.id, actorRunId))
+              .then((rows) => rows[0] ?? null)
+          : null;
+        const actorRunTerminal = Boolean(
+          actorRun && TERMINAL_HEARTBEAT_RUN_STATUSES.has(actorRun.status),
+        );
+        const remediation = actorRunTerminal
+          ? {
+              code: "actor_run_terminal",
+              actorRunStatus: actorRun!.status,
+              message:
+                `Run ${actorRunId} is ${actorRun!.status} but its agent body is still executing. ` +
+                `This issue is not owned by another run; re-checkout the issue to re-bind it to a live run, ` +
+                `or start a new run for the issue before writing.`,
+            }
+          : row.checkoutRunId
+            ? {
+                code: "checkout_owned_by_other_run",
+                message:
+                  `Run ${actorRunId ?? "(none)"} does not own this issue. ` +
+                  `It is checked out by run ${row.checkoutRunId}. ` +
+                  `Do not resend the run-id header; wait for the owning run to finish or release the checkout.`,
+              }
+            : {
+                code: "issue_not_owned_by_actor",
+                message:
+                  `Run ${actorRunId ?? "(none)"} does not own this issue and the issue has no live checkout owner. ` +
+                  `Do not resend the run-id header; check out the issue to bind it to your run first.`,
+              };
+        return conflict("Issue run ownership conflict", {
+          issueId: row.id,
+          status: row.status,
+          assigneeAgentId: row.assigneeAgentId,
+          checkoutRunId: row.checkoutRunId,
+          executionRunId: row.executionRunId,
           actorAgentId,
           actorRunId,
+          actorRunStatus: actorRun?.status ?? null,
+          remediation,
         });
+      };
+
+      if (resolvedLatest.latest) {
+        throw await buildOwnershipConflict(resolvedLatest.latest);
       }
 
-      throw conflict("Issue run ownership conflict", {
-        issueId: latest.id,
-        status: latest.status,
-        assigneeAgentId: latest.assigneeAgentId,
-        checkoutRunId: latest.checkoutRunId,
-        executionRunId: latest.executionRunId,
-        actorAgentId,
-        actorRunId,
-      });
+      throw await buildOwnershipConflict(latest);
     },
 
     release: async (id: string, actorAgentId?: string, actorRunId?: string | null) =>

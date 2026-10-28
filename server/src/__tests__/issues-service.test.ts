@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { asc, eq } from "drizzle-orm";
-import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { sql } from "drizzle-orm";
 import {
   activityLog,
@@ -25,7 +25,14 @@ import {
   projectWorkspaces,
   projects,
   workspaceOperations,
-} from "@paperclipai/db";
+  companyMemberships,
+  issueAccessGrants,
+  issueRecoveryActions,
+  issueWorkProducts,
+  projectAccessMembers,
+  toolApplications,
+  toolConnections,
+  toolOauthStates,} from "@paperclipai/db";
 import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
@@ -42,6 +49,8 @@ import {
   WORKSPACE_WORKTREE_REQUIRES_PROJECT_MESSAGE,
   WORKSPACE_WORKTREE_REQUIRES_PROJECT_REMEDIATION,
 } from "../services/execution-workspace-policy.ts";
+import { MAX_CHILD_ISSUES_CREATED_BY_HELPER } from "../services/issue-child-limits.js";
+import { readIssueCommentRunLogText } from "../services/comment-run-log-attribution.js";
 import { buildAgentMentionHref, buildProjectMentionHref, MAX_ISSUE_REQUEST_DEPTH, type IssueWorkMode } from "@paperclipai/shared";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
@@ -55,6 +64,15 @@ function deferred<T>() {
     reject = promiseReject;
   });
   return { promise, resolve, reject };
+}
+
+async function seedIssueCompany(db: ReturnType<typeof createDb>, companyId: string) {
+  await db.insert(companies).values({
+    id: companyId,
+    name: "Paperclip",
+    issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+    requireBoardApprovalForNewAgents: false,
+  });
 }
 
 describe("issue list limit helpers", () => {
@@ -267,6 +285,388 @@ describe("deriveIssueCommentRunLogAttribution", () => {
 
     expect(derived.has(commentId)).toBe(false);
   });
+
+describeEmbeddedPostgres("issueService.assertCheckoutOwner preserves the acting run's own binding", () => {
+  let db!: ReturnType<typeof createDb>;
+  let svc!: ReturnType<typeof issueService>;
+  let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
+
+  beforeAll(async () => {
+    tempDb = await startEmbeddedPostgresTestDatabase("paperclip-issues-own-binding-");
+    db = createDb(tempDb.connectionString);
+    svc = issueService(db);
+  }, 20_000);
+
+  afterEach(async () => {
+    await db.delete(issueComments);
+    await db.delete(issueRelations);
+    await db.delete(issueInboxArchives);
+    await db.delete(activityLog);
+    await db.delete(issues);
+    await db.delete(heartbeatRuns);
+    await db.delete(executionWorkspaces);
+    await db.delete(projectWorkspaces);
+    await db.delete(projects);
+    await db.delete(goals);
+    await db.delete(agents);
+    await db.delete(instanceSettings);
+    await db.delete(companyMemberships);
+    await db.delete(companies);
+  });
+
+  afterAll(async () => {
+    await tempDb?.cleanup();
+  });
+
+  /**
+   * Seeds an issue whose checkout AND execution binding both point at the
+   * actor's own run, with that run already terminal. This is the exact shape
+   * the runtime produces when it supersedes a run row (`cancelled`) while the
+   * agent body keeps executing.
+   */
+  async function seedSelfBoundTerminalIssue(params: {
+    actorRunStatus: "cancelled" | "failed" | "timed_out" | "succeeded" | "interrupted";
+    issueStatus?: "in_progress" | "blocked";
+  }) {
+    const companyId = randomUUID();
+    const actorAgentId = randomUUID();
+    const actorRunId = randomUUID();
+    const issueId = randomUUID();
+
+    await seedIssueCompany(db, companyId);
+    await db.insert(agents).values({
+      id: actorAgentId,
+      companyId,
+      name: "Actor",
+      role: "engineer",
+      status: "active",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    await db.insert(heartbeatRuns).values({
+      id: actorRunId,
+      companyId,
+      agentId: actorAgentId,
+      status: params.actorRunStatus,
+      invocationSource: "manual",
+      startedAt: new Date(),
+      finishedAt: new Date(),
+    });
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Actor keeps its own checkout",
+      status: params.issueStatus ?? "in_progress",
+      priority: "high",
+      assigneeAgentId: actorAgentId,
+      checkoutRunId: actorRunId,
+      executionRunId: actorRunId,
+      executionLockedAt: new Date(),
+      executionAgentNameKey: "actor",
+    });
+
+    return { issueId, companyId, actorAgentId, actorRunId };
+  }
+
+  it.each(["cancelled", "failed", "timed_out", "succeeded", "interrupted"] as const)(
+    "keeps the actor's own binding when the actor run is %s",
+    async actorRunStatus => {
+      const seeded = await seedSelfBoundTerminalIssue({ actorRunStatus });
+
+      const ownership = await svc.assertCheckoutOwner(
+        seeded.issueId,
+        seeded.actorAgentId,
+        seeded.actorRunId,
+      );
+
+      expect(ownership.checkoutRunId).toBe(seeded.actorRunId);
+      expect(ownership.executionRunId).toBe(seeded.actorRunId);
+      expect(ownership.adoptedFromRunId).toBeNull();
+
+      // The binding must survive on the row, not merely be echoed back.
+      const row = await db
+        .select({
+          checkoutRunId: issues.checkoutRunId,
+          executionRunId: issues.executionRunId,
+        })
+        .from(issues)
+        .where(eq(issues.id, seeded.issueId))
+        .then((rows) => rows[0]);
+      expect(row).toEqual({
+        checkoutRunId: seeded.actorRunId,
+        executionRunId: seeded.actorRunId,
+      });
+    },
+  );
+
+  it.each(["failed", "timed_out", "succeeded", "interrupted"] as const)(
+    "lets an actor with a %s run status still write to its own checked-out issue",
+    async actorRunStatus => {
+      const seeded = await seedSelfBoundTerminalIssue({ actorRunStatus });
+
+      const updated = await svc.update(seeded.issueId, {
+        title: `Edited by a ${actorRunStatus}-run actor`,
+        actorAgentId: seeded.actorAgentId,
+        actorRunId: seeded.actorRunId,
+      });
+
+      expect(updated).toMatchObject({
+        id: seeded.issueId,
+        title: `Edited by a ${actorRunStatus}-run actor`,
+      });
+    },
+  );
+
+  it("rejects a cancelled run with the cancellation code, not an ownership conflict", async () => {
+    // `cancelled` is the platform's explicit Stop signal: write authority is
+    // revoked by design in `assertAgentRunWriteAllowed`. That guard must keep
+    // precedence over the ownership check, and its error must name the cause
+    // instead of blaming the run-id header.
+    const seeded = await seedSelfBoundTerminalIssue({ actorRunStatus: "cancelled" });
+
+    const error = await svc
+      .update(seeded.issueId, {
+        title: "Edited by a cancelled-run actor",
+        actorAgentId: seeded.actorAgentId,
+        actorRunId: seeded.actorRunId,
+      })
+      .then(() => null, (err: any) => err);
+
+    expect(error).toBeTruthy();
+    expect(error.status).toBe(403);
+    expect(error.details?.code).toBe("agent_run_cancelled");
+  });
+
+  it("still clears a foreign terminal owner's binding so the assignee can adopt it", async () => {
+    const seeded = await seedSelfBoundTerminalIssue({ actorRunStatus: "cancelled" });
+    const foreignRunId = randomUUID();
+    const foreignAgentId = randomUUID();
+
+    await db.insert(agents).values({
+      id: foreignAgentId,
+      companyId: seeded.companyId,
+      name: "Foreign owner",
+      role: "engineer",
+      status: "active",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    await db.insert(heartbeatRuns).values({
+      id: foreignRunId,
+      companyId: seeded.companyId,
+      agentId: foreignAgentId,
+      status: "failed",
+      invocationSource: "manual",
+      startedAt: new Date(),
+      finishedAt: new Date(),
+    });
+    await db
+      .update(issues)
+      .set({
+        checkoutRunId: foreignRunId,
+        executionRunId: foreignRunId,
+      })
+      .where(eq(issues.id, seeded.issueId));
+
+    // The actor's run is live here, so the stale foreign binding is cleared and
+    // the actor adopts ownership as before.
+    await db
+      .update(heartbeatRuns)
+      .set({ status: "running", finishedAt: null })
+      .where(eq(heartbeatRuns.id, seeded.actorRunId));
+
+    const ownership = await svc.assertCheckoutOwner(
+      seeded.issueId,
+      seeded.actorAgentId,
+      seeded.actorRunId,
+    );
+
+    // The stale foreign binding is cleared and the live actor re-binds the
+    // issue to itself.
+    expect(ownership.checkoutRunId).toBe(seeded.actorRunId);
+    expect(ownership.executionRunId).toBe(seeded.actorRunId);
+    const row = await db
+      .select({
+        checkoutRunId: issues.checkoutRunId,
+        executionRunId: issues.executionRunId,
+      })
+      .from(issues)
+      .where(eq(issues.id, seeded.issueId))
+      .then((rows) => rows[0]);
+    expect(row).toEqual({
+      checkoutRunId: seeded.actorRunId,
+      executionRunId: seeded.actorRunId,
+    });
+  });
+
+  it("names the terminal actor run as the conflict cause instead of pointing at the run-id header", async () => {
+    const seeded = await seedSelfBoundTerminalIssue({
+      actorRunStatus: "cancelled",
+      issueStatus: "blocked",
+    });
+
+    // A blocked issue never reaches the in-progress ownership branch, so the
+    // conflict path is reached with the actor's own terminal run.
+    await expect(
+      svc.assertCheckoutOwner(seeded.issueId, seeded.actorAgentId, seeded.actorRunId),
+    ).rejects.toMatchObject({
+      status: 409,
+      details: {
+        actorRunStatus: "cancelled",
+        remediation: {
+          code: "actor_run_terminal",
+          actorRunStatus: "cancelled",
+        },
+      },
+    });
+  });
+
+  it("does not tell the caller to resend a run-id header that was already correct", async () => {
+    const seeded = await seedSelfBoundTerminalIssue({
+      actorRunStatus: "cancelled",
+      issueStatus: "blocked",
+    });
+
+    const error = await svc
+      .assertCheckoutOwner(seeded.issueId, seeded.actorAgentId, seeded.actorRunId)
+      .then(() => null, (err: any) => err);
+
+    expect(error).toBeTruthy();
+    const details = error.details ?? {};
+    expect(details.remediation?.code).toBe("actor_run_terminal");
+    expect(String(details.remediation?.message ?? "")).not.toMatch(
+      /X-Paperclip-Run-Id|resend the run-id header/i,
+    );
+  });
+
+  it("lets a terminal actor run re-adopt its own stale checkout binding", async () => {
+    // The issue's checkoutRunId still points at the actor's own run, but the
+    // run row has since gone terminal. The actor may re-bind it to itself: the
+    // binding was never owned by a different run, so re-adopting it cannot
+    // take the issue away from anybody. A terminal actor run may NOT adopt a
+    // binding owned by a different run.
+    const seeded = await seedSelfBoundTerminalIssue({ actorRunStatus: "failed" });
+    const foreignRunId = randomUUID();
+    const foreignAgentId = randomUUID();
+
+    await db.insert(agents).values({
+      id: foreignAgentId,
+      companyId: seeded.companyId,
+      name: "Foreign owner",
+      role: "engineer",
+      status: "active",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    await db.insert(heartbeatRuns).values({
+      id: foreignRunId,
+      companyId: seeded.companyId,
+      agentId: foreignAgentId,
+      status: "failed",
+      invocationSource: "manual",
+      startedAt: new Date(),
+      finishedAt: new Date(),
+    });
+    // The issue is checked out by the *foreign* terminal run.
+    await db
+      .update(issues)
+      .set({
+        checkoutRunId: foreignRunId,
+        executionRunId: foreignRunId,
+      })
+      .where(eq(issues.id, seeded.issueId));
+
+    // A terminal actor run must not take over another run's binding.
+    await expect(
+      svc.assertCheckoutOwner(seeded.issueId, seeded.actorAgentId, seeded.actorRunId),
+    ).rejects.toMatchObject({ status: 409 });
+  });
+
+  it("keeps the per-run cross-issue influence cap enforced", async () => {
+    // The 429 cap is a designed safety backstop, not part of this defect.
+    // Assert it still bites against real Postgres: an agent that owns one
+    // issue and sprays writes across 20 others is still rejected.
+    const {
+      CROSS_ISSUE_INFLUENCE_ENFORCE_AT,
+      observeCrossIssueInfluence,
+    } = await import("../services/cross-issue-influence-limit.ts");
+
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const runId = randomUUID();
+    const ownedIssueId = randomUUID();
+    const otherIssueId = randomUUID();
+
+    await seedIssueCompany(db, companyId);
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "Spray agent",
+      role: "engineer",
+      status: "active",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    await db.insert(heartbeatRuns).values({
+      id: runId,
+      companyId,
+      agentId,
+      status: "running",
+      contextSnapshot: {},
+    });
+    await db.insert(issues).values([
+      {
+        id: ownedIssueId,
+        companyId,
+        title: "Owned issue",
+        status: "in_progress",
+        checkoutRunId: runId,
+        executionRunId: runId,
+      },
+      {
+        id: otherIssueId,
+        companyId,
+        title: "Another issue",
+        status: "todo",
+      },
+    ]);
+    // The budget is already spent.
+    await db.insert(activityLog).values(
+      Array.from({ length: 20 }, () => ({
+        companyId,
+        actorType: "agent" as const,
+        actorId: agentId,
+        agentId,
+        runId,
+        action: "issue.cross_issue_influence_observed",
+        entityType: "issue",
+        entityId: otherIssueId,
+      })),
+    );
+
+    const decision = await observeCrossIssueInfluence(db, {
+      companyId,
+      runId,
+      agentId,
+      targetIssueId: otherIssueId,
+      targetIssueIdentifier: "CAP-9",
+      kind: "comment",
+      now: CROSS_ISSUE_INFLUENCE_ENFORCE_AT,
+    });
+
+    // The cap is a designed safety backstop, not a bug: it must still bite.
+    expect(decision).toMatchObject({ allowed: false, count: 21 });
+  });
+});
+
 });
 
 async function ensureIssueRelationsTable(db: ReturnType<typeof createDb>) {
@@ -2590,9 +2990,63 @@ describeEmbeddedPostgres("issueService.list participantAgentId", () => {
 
     expect(result).toBeTruthy();
     expect(result?.description).toHaveLength(1200);
+    expect(result?.descriptionTruncated).toBe(true);
     expect(result?.executionPolicy).toBeNull();
     expect(result?.executionState).toBeNull();
     expect(result?.executionWorkspaceSettings).toBeNull();
+  });
+
+  it("marks list descriptions as not truncated when they fit the preview limit", async () => {
+    const companyId = randomUUID();
+    const issueId = randomUUID();
+    const description = "x".repeat(1200);
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Exact preview issue",
+      description,
+      status: "todo",
+      priority: "medium",
+    });
+
+    const [result] = await svc.list(companyId);
+
+    expect(result?.description).toHaveLength(1200);
+    expect(result?.descriptionTruncated).toBe(false);
+  });
+
+  it("marks null list descriptions as not truncated", async () => {
+    const companyId = randomUUID();
+    const issueId = randomUUID();
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Null description issue",
+      description: null,
+      status: "todo",
+      priority: "medium",
+    });
+
+    const [result] = await svc.list(companyId);
+
+    expect(result?.description).toBeNull();
+    expect(result?.descriptionTruncated).toBe(false);
   });
 
   it("does not let description preview truncation split multibyte characters", async () => {
@@ -2620,6 +3074,7 @@ describeEmbeddedPostgres("issueService.list participantAgentId", () => {
 
     expect(result?.description).toHaveLength(1200);
     expect(result?.description?.endsWith("—")).toBe(true);
+    expect(result?.descriptionTruncated).toBe(true);
   });
 });
 
@@ -4535,6 +4990,13 @@ describeEmbeddedPostgres("issueService blockers and dependency wake readiness", 
         title: "Child A",
         status: "done",
         priority: "medium",
+        // Give the children distinct, ordered issue numbers. The service
+        // sorts direct children by issueNumber, then createdAt. A batched
+        // insert gives every row in the statement the same defaultNow()
+        // createdAt, so without a distinct issueNumber the two children
+        // tie on both sort keys and the database is free to return them
+        // in either order.
+        issueNumber: 1,
       },
       {
         id: childB,
@@ -4543,6 +5005,7 @@ describeEmbeddedPostgres("issueService blockers and dependency wake readiness", 
         title: "Child B",
         status: "blocked",
         priority: "medium",
+        issueNumber: 2,
       },
     ]);
 

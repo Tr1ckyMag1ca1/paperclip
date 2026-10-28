@@ -156,6 +156,11 @@ export const routineRuns = pgTable(
     idempotencyKey: text("idempotency_key"),
     triggerPayload: jsonb("trigger_payload").$type<Record<string, unknown>>(),
     dispatchFingerprint: text("dispatch_fingerprint"),
+    // The schedule slot this run belongs to ("<triggerId>:<occurrence>" for
+    // scheduled fires, "<triggerId>" for slot-less sources). Recorded on every
+    // run so a skipped trigger leaves a durable, queryable trace that
+    // distinguishes "the trigger was suppressed" from "the run failed".
+    slotKey: text("slot_key"),
     linkedIssueId: uuid("linked_issue_id").references(() => issues.id, { onDelete: "set null" }),
     coalescedIntoRunId: uuid("coalesced_into_run_id"),
     failureReason: text("failure_reason"),

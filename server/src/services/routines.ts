@@ -87,6 +87,11 @@ const LIVE_HEARTBEAT_RUN_STATUSES = ["queued", "running", "scheduled_retry"];
 const TERMINAL_ISSUE_STATUSES = new Set(["done", "cancelled"]);
 const MAX_CATCH_UP_RUNS = 25;
 const MAX_ROUTINE_REVISIONS = 100;
+// An execution issue whose live heartbeat run has not made progress inside this
+// window is treated as stale: the wrapper is still "open" but the run behind it
+// is wedged (adapter errors, exhausted retries), so it must not hold a routine
+// slot hostage forever.
+const STALE_EXECUTION_ISSUE_AFTER_MS = 15 * 60 * 1000;
 const EXECUTION_ISSUE_TRANSIENT_FAILURE_CODE = "execution_issue_status";
 const EXECUTION_ISSUE_TRANSIENT_FAILURE_STATUSES = ["blocked", "cancelled"] as const;
 const ACTIVITY_GATE_IGNORED_ACTIONS = [
@@ -506,6 +511,26 @@ function mergeRoutineRunPayload(
   };
 }
 
+/**
+ * Attaches a top-level trace key to a routine run payload.
+ *
+ * `mergeRoutineRunPayload` nests values under `payload.variables`, which is
+ * where interpolated routine variables live. A concurrency trace is not a
+ * variable — it is run metadata that has to be readable at the top level of
+ * `trigger_payload` so a skipped dispatch can be told apart from a failed one
+ * with a single query.
+ */
+function withRoutineRunTrace(
+  payload: Record<string, unknown> | null | undefined,
+  key: string,
+  detail: Record<string, unknown>,
+) {
+  return {
+    ...(payload ?? {}),
+    [key]: detail,
+  };
+}
+
 function normalizeRoutineDispatchFingerprintValue(value: unknown): unknown {
   if (value === undefined) return null;
   if (value == null || typeof value === "string" || typeof value === "number" || typeof value === "boolean") {
@@ -543,6 +568,35 @@ function createRoutineDispatchFingerprint(input: {
 function createRoutineEnvFingerprint(env: unknown) {
   const canonical = JSON.stringify(normalizeRoutineDispatchFingerprintValue(env ?? null));
   return crypto.createHash("sha256").update(canonical).digest("hex");
+}
+
+/**
+ * The schedule slot a dispatch belongs to.
+ *
+ * A routine can fire several triggers (a morning slot and an evening slot, for
+ * example) and every trigger can fire once per date. Concurrency guards that
+ * are meant to stop *overlapping* work have to be able to tell those slots
+ * apart: an execution issue for the evening slot must never stop the morning
+ * slot from running.
+ *
+ * The key is `<triggerId>` for sources without a schedule occurrence (manual,
+ * api, webhook) and `<triggerId>:<occurrence>` for scheduled fires, where the
+ * occurrence is the cron tick in the trigger's own timezone. Two fires of the
+ * same trigger therefore only share a slot when they are the same tick.
+ */
+export function routineSlotKey(input: {
+  triggerId?: string | null;
+  timeZone?: string | null;
+  occurrenceAt?: Date | null;
+}) {
+  const triggerId = input.triggerId?.trim();
+  if (!triggerId) return null;
+  if (!input.occurrenceAt) return `t:${triggerId}`;
+  const timeZone = input.timeZone?.trim() || "UTC";
+  const parts = getZonedMinuteParts(input.occurrenceAt, timeZone);
+  const pad = (value: number) => String(value).padStart(2, "0");
+  const occurrence = `${parts.year}-${pad(parts.month)}-${pad(parts.day)}T${pad(parts.hour)}:${pad(parts.minute)}`;
+  return `t:${triggerId}:${occurrence}@${timeZone}`;
 }
 
 function readManagedRoutineIssueTemplate(defaultsJson: Record<string, unknown> | null | undefined) {
@@ -1528,17 +1582,153 @@ export function routineService(
     );
   }
 
+  /**
+   * Restricts live-execution lookups to the slot a dispatch belongs to.
+   *
+   * Without this, any live execution issue for the routine blocked the next
+   * dispatch — including a dispatch belonging to a different trigger on a
+   * different date. That turned one wedged wrapper into head-of-line blocking
+   * for the whole routine.
+   *
+   * A per-slot guard must still catch the wrapper that belongs to *this* slot
+   * (that is the duplicate-wake the guard exists to prevent) while ignoring
+   * every sibling slot of the same trigger and every other trigger. The arms
+   * below are exactly that:
+   *
+   *   1. the exact slot key            → this slot's own wrapper, blocks
+   *   2. legacy row of this trigger     → pre-slot-tracking wrapper, blocks
+   *   3. legacy row of unknown trigger  → pre-slot-tracking wrapper, blocks
+   *
+   * A sibling slot of the same trigger (e.g. Monday 08:00 while Tuesday 08:00
+   * is still open) matches none of the arms and therefore never blocks.
+   */
+  function routineExecutionSlotCondition(scope?: { slotKey?: string | null; triggerId?: string | null } | null) {
+    if (!scope) return null;
+    if (!scope.slotKey && !scope.triggerId) return null;
+    const arms = [];
+    if (scope.slotKey) {
+      arms.push(eq(issues.originSlotKey, scope.slotKey));
+    }
+    if (scope.triggerId) {
+      // Legacy rows (NULL slot key) that belong to THIS trigger still block it:
+      // they predate slot tracking, so their slot is unknown, but they are known
+      // to belong to the same trigger and must not overlap with it.
+      arms.push(and(isNull(issues.originSlotKey), eq(issues.originTriggerId, scope.triggerId)));
+      // Legacy rows with no trigger recorded at all predate trigger tracking
+      // too. They are attributed to the routine as a whole and block
+      // conservatively — but only for sources that carry no trigger, because a
+      // scheduled dispatch can attribute its own slot precisely.
+      arms.push(and(isNull(issues.originSlotKey), isNull(issues.originTriggerId)));
+    }
+    if (arms.length === 0) return null;
+    return or(...arms);
+  }
+
+  type LiveExecutionIssueCandidate = {
+    issue: typeof issues.$inferSelect;
+    liveRunUpdatedAt: Date | null;
+    liveRunStartedAt: Date | null;
+  };
+
+  /**
+   * A live execution issue is stale when neither the issue nor the heartbeat
+   * run behind it has moved inside the stale window. Such a wrapper is wedged:
+   * its run keeps failing and restarting, so it can hold its slot forever. It is
+   * reported separately so the caller can reclaim the slot instead of skipping.
+   */
+  function isStaleExecutionCandidate(candidate: LiveExecutionIssueCandidate, now: Date) {
+    const issueUpdatedAt = candidate.issue.updatedAt instanceof Date
+      ? candidate.issue.updatedAt
+      : new Date(candidate.issue.updatedAt);
+    const runUpdatedAt = candidate.liveRunUpdatedAt;
+    const lastProgressAt = runUpdatedAt && runUpdatedAt > issueUpdatedAt ? runUpdatedAt : issueUpdatedAt;
+    return now.getTime() - lastProgressAt.getTime() > STALE_EXECUTION_ISSUE_AFTER_MS;
+  }
+
+  /**
+   * Releases a wedged execution wrapper so the slot can be reclaimed.
+   *
+   * The wrapper keeps its history (it stays open and visible — the wedge is a
+   * fact worth reviewing), but it stops holding the slot: the execution claim is
+   * cleared, which both removes it from the open-execution unique index and
+   * stops it from answering the live-execution lookup for this routine.
+   *
+   * A comment is left on the wrapper so the reclaim is visible to whoever reads
+   * the wrapper later, and the reclaim is recorded on the dispatching run.
+   */
+  async function releaseStaleExecutionIssue(
+    candidate: LiveExecutionIssueCandidate,
+    context: { slotKey: string | null; triggerId: string | null; reclaimedAt: Date },
+    executor: Db = db,
+  ) {
+    const issueId = candidate.issue.id;
+    const previousExecutionRunId = candidate.issue.executionRunId ?? null;
+    const released = await executor
+      .update(issues)
+      .set({
+        executionRunId: null,
+        executionAgentNameKey: null,
+        executionLockedAt: null,
+        updatedAt: new Date(),
+      })
+      .where(
+        and(
+          eq(issues.id, issueId),
+          previousExecutionRunId
+            ? eq(issues.executionRunId, previousExecutionRunId)
+            : isNull(issues.executionRunId),
+        ),
+      )
+      .returning({ id: issues.id })
+      .then((rows) => rows[0] ?? null);
+    if (!released) return false;
+
+    const reclaimNote = [
+      "Slot reclaimed by a later dispatch of the same routine.",
+      "",
+      `- slot: \`${context.slotKey ?? "unknown"}\``,
+      `- trigger: \`${context.triggerId ?? "unknown"}\``,
+      `- reclaimed at: ${context.reclaimedAt.toISOString()}`,
+      `- stale window: ${STALE_EXECUTION_ISSUE_AFTER_MS / 60_000} minutes without progress`,
+      `- released execution run: \`${previousExecutionRunId ?? "none"}\``,
+    ].join("\n");
+    try {
+      await issueSvc.addComment(
+        issueId,
+        reclaimNote,
+        {},
+        { authorType: "system" },
+        executor,
+      );
+    } catch {
+      // A reclaim trace is best-effort: the release itself is the durable
+      // effect and must not be undone by a comment failure.
+    }
+    return true;
+  }
+
   async function findLiveExecutionIssue(
     routine: typeof routines.$inferSelect,
     executor: Db = db,
     dispatchFingerprint?: string | null,
     origin?: { kind: string; id: string | null },
+    scope?: { slotKey?: string | null; triggerId?: string | null } | null,
   ) {
     const fingerprintCondition = routineExecutionFingerprintCondition(dispatchFingerprint);
+    const slotCondition = routineExecutionSlotCondition(scope);
     const originKind = origin?.kind ?? "routine_execution";
     const originId = origin?.id ?? routine.id;
+    const baseConditions = [
+      eq(issues.companyId, routine.companyId),
+      eq(issues.originKind, originKind),
+      eq(issues.originId, originId),
+      inArray(issues.status, OPEN_ISSUE_STATUSES),
+      visibleIssueCondition(),
+      ...(fingerprintCondition ? [fingerprintCondition] : []),
+      ...(slotCondition ? [slotCondition] : []),
+    ];
     const executionBoundIssue = await executor
-      .select()
+      .select({ issue: issues, liveRunUpdatedAt: heartbeatRuns.updatedAt, liveRunStartedAt: heartbeatRuns.startedAt })
       .from(issues)
       .innerJoin(
         heartbeatRuns,
@@ -1547,23 +1737,14 @@ export function routineService(
           inArray(heartbeatRuns.status, LIVE_HEARTBEAT_RUN_STATUSES),
         ),
       )
-      .where(
-        and(
-          eq(issues.companyId, routine.companyId),
-          eq(issues.originKind, originKind),
-          eq(issues.originId, originId),
-          inArray(issues.status, OPEN_ISSUE_STATUSES),
-          visibleIssueCondition(),
-          ...(fingerprintCondition ? [fingerprintCondition] : []),
-        ),
-      )
+      .where(and(...baseConditions))
       .orderBy(desc(issues.updatedAt), desc(issues.createdAt))
       .limit(1)
-      .then((rows) => rows[0]?.issues ?? null);
+      .then((rows) => rows[0] ?? null);
     if (executionBoundIssue) return executionBoundIssue;
 
-    return executor
-      .select()
+    const contextBoundIssue = await executor
+      .select({ issue: issues, liveRunUpdatedAt: heartbeatRuns.updatedAt, liveRunStartedAt: heartbeatRuns.startedAt })
       .from(issues)
       .innerJoin(
         heartbeatRuns,
@@ -1573,19 +1754,13 @@ export function routineService(
           sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = cast(${issues.id} as text)`,
         ),
       )
-      .where(
-        and(
-          eq(issues.companyId, routine.companyId),
-          eq(issues.originKind, originKind),
-          eq(issues.originId, originId),
-          inArray(issues.status, OPEN_ISSUE_STATUSES),
-          visibleIssueCondition(),
-          ...(fingerprintCondition ? [fingerprintCondition] : []),
-        ),
-      )
+      .where(and(...baseConditions))
       .orderBy(desc(issues.updatedAt), desc(issues.createdAt))
       .limit(1)
-      .then((rows) => rows[0]?.issues ?? null);
+      .then((rows) => rows[0] ?? null);
+    if (contextBoundIssue) return contextBoundIssue;
+
+    return null;
   }
 
   async function finalizeRun(runId: string, patch: Partial<typeof routineRuns.$inferInsert>, executor: Db = db) {
@@ -1710,6 +1885,9 @@ export function routineService(
     executionWorkspaceSettings?: Record<string, unknown> | null;
     descriptionAppendix?: string | null;
     nextRunAtOverride?: Date | null;
+    // The cron tick this dispatch belongs to, used to key the schedule slot.
+    // Null for sources without a schedule (manual, api, webhook).
+    occurrenceAt?: Date | null;
     actor?: Actor;
   }) {
     const projectId = input.projectId ?? input.routine.projectId ?? null;
@@ -1770,6 +1948,20 @@ export function routineService(
       title,
       description,
     });
+    // The dispatch fingerprint identifies the *shape* of a dispatch (payload,
+    // title, description). It does not identify which schedule slot fired, so
+    // two different slots of the same routine routinely share one fingerprint.
+    // The slot key carries that missing dimension: it is what lets a
+    // concurrency guard tell "this slot is already running" apart from "some
+    // other slot is still running".
+    const slotKey = input.trigger
+      ? routineSlotKey({
+          triggerId: input.trigger.id,
+          timeZone: input.trigger.timezone,
+          occurrenceAt: input.occurrenceAt ?? null,
+        })
+      : null;
+    const triggerId = input.trigger?.id ?? null;
     let reusedExistingRun = false;
     const run = await db.transaction(async (tx) => {
       const txDb = tx as unknown as Db;
@@ -1844,6 +2036,7 @@ export function routineService(
           idempotencyKey: input.idempotencyKey ?? null,
           triggerPayload,
           dispatchFingerprint,
+          slotKey,
           routineRevisionId: input.routine.latestRevisionId,
           responsibleUserId,
         })
@@ -1857,16 +2050,53 @@ export function routineService(
 
       let createdIssue: Awaited<ReturnType<typeof issueSvc.create>> | null = null;
       try {
-        const activeIssue = await findLiveExecutionIssue(input.routine, txDb, dispatchFingerprint, {
-          kind: issueOriginKind,
-          id: issueOriginId,
-        });
+        // The scope a live-execution conflict has to fall inside. skip_if_active
+        // is a per-slot guard: only a live execution issue for the SAME slot may
+        // suppress this dispatch. coalesce_if_active keeps its routine-wide
+        // behaviour, so it is looked up without a slot scope.
+        const concurrencyScope = input.routine.concurrencyPolicy === "skip_if_active"
+          ? { slotKey, triggerId }
+          : null;
+        const activeCandidate = await findLiveExecutionIssue(
+          input.routine,
+          txDb,
+          dispatchFingerprint,
+          { kind: issueOriginKind, id: issueOriginId },
+          concurrencyScope,
+        );
+        // A wedged wrapper must not hold its slot hostage: when neither the issue
+        // nor the run behind it has moved inside the stale window, the slot is
+        // reclaimable and this dispatch proceeds instead of skipping. The
+        // reclaim is durable — the wedged wrapper is released and says so.
+        let staleReclaim: { issueId: string; identifier: string | null } | null = null;
+        let activeIssue = activeCandidate?.issue ?? null;
+        if (activeIssue && isStaleExecutionCandidate(activeCandidate!, triggeredAt)) {
+          const released = await releaseStaleExecutionIssue(activeCandidate!, {
+            slotKey,
+            triggerId,
+            reclaimedAt: triggeredAt,
+          }, txDb);
+          if (released) {
+            staleReclaim = { issueId: activeIssue.id, identifier: activeIssue.identifier };
+            activeIssue = null;
+          }
+        }
         if (activeIssue && input.routine.concurrencyPolicy !== "always_enqueue") {
           const status = input.routine.concurrencyPolicy === "skip_if_active" ? "skipped" : "coalesced";
+          const skipDetail = {
+            reason: "live_execution_in_slot",
+            slotKey,
+            triggerId,
+            blockingIssueId: activeIssue.id,
+            blockingIssueIdentifier: activeIssue.identifier,
+            blockingSlotKey: activeIssue.originSlotKey,
+            blockingTriggerId: activeIssue.originTriggerId,
+          };
           const updated = await finalizeRun(createdRun.id, {
             status,
             linkedIssueId: activeIssue.id,
             coalescedIntoRunId: activeIssue.originRunId,
+            triggerPayload: withRoutineRunTrace(triggerPayload, "skip", skipDetail),
             completedAt: triggeredAt,
           }, txDb);
           await updateRoutineTouchedState({
@@ -1899,6 +2129,8 @@ export function routineService(
             originId: issueOriginId,
             originRunId: createdRun.id,
             originFingerprint: dispatchFingerprint,
+            originSlotKey: slotKey,
+            originTriggerId: triggerId,
             billingCode: issueBillingCode,
             executionWorkspaceId: input.executionWorkspaceId ?? null,
             executionWorkspacePreference: input.executionWorkspacePreference ?? null,
@@ -1916,16 +2148,30 @@ export function routineService(
             throw error;
           }
 
-          const existingIssue = await findLiveExecutionIssue(input.routine, txDb, dispatchFingerprint, {
-            kind: issueOriginKind,
-            id: issueOriginId,
-          });
-          if (!existingIssue) throw error;
+          const existingCandidate = await findLiveExecutionIssue(
+            input.routine,
+            txDb,
+            dispatchFingerprint,
+            { kind: issueOriginKind, id: issueOriginId },
+            input.routine.concurrencyPolicy === "skip_if_active" ? { slotKey, triggerId } : null,
+          );
+          if (!existingCandidate) throw error;
+          const existingIssue = existingCandidate.issue;
           const status = input.routine.concurrencyPolicy === "skip_if_active" ? "skipped" : "coalesced";
+          const skipDetail = {
+            reason: "live_execution_in_slot",
+            slotKey,
+            triggerId,
+            blockingIssueId: existingIssue.id,
+            blockingIssueIdentifier: existingIssue.identifier,
+            blockingSlotKey: existingIssue.originSlotKey,
+            blockingTriggerId: existingIssue.originTriggerId,
+          };
           const updated = await finalizeRun(createdRun.id, {
             status,
             linkedIssueId: existingIssue.id,
             coalescedIntoRunId: existingIssue.originRunId,
+            triggerPayload: withRoutineRunTrace(triggerPayload, "skip", skipDetail),
             completedAt: triggeredAt,
           }, txDb);
           await updateRoutineTouchedState({
@@ -1952,6 +2198,20 @@ export function routineService(
         const updated = await finalizeRun(createdRun.id, {
           status: "issue_created",
           linkedIssueId: createdIssue.id,
+          // A reclaim is part of the dispatch's history: "this slot was held by
+          // a wedged wrapper, which was released" has to be as queryable as
+          // "this slot was skipped".
+          triggerPayload: staleReclaim
+            ? withRoutineRunTrace(triggerPayload, "reclaim", {
+                reason: "stale_execution_issue_released",
+                slotKey,
+                triggerId,
+                releasedIssueId: staleReclaim.issueId,
+                releasedIssueIdentifier: staleReclaim.identifier,
+                staleWindowMinutes: STALE_EXECUTION_ISSUE_AFTER_MS / 60_000,
+                reclaimedAt: triggeredAt.toISOString(),
+              })
+            : triggerPayload,
         }, txDb);
         await updateRoutineTouchedState({
           routineId: input.routine.id,
@@ -2232,7 +2492,7 @@ export function routineService(
                 : null,
             })),
           ),
-        findLiveExecutionIssue(row),
+        findLiveExecutionIssue(row).then((candidate) => candidate?.issue ?? null),
         listManagedRoutineMetadata([row.id]),
       ]);
 
@@ -3252,6 +3512,10 @@ export function routineService(
 
         let runCount = 1;
         let claimedNextRunAt = nextCronTickInTimeZone(row.trigger.cronExpression, row.trigger.timezone, now);
+        // The cron tick this dispatch belongs to. Catch-up fires walk several
+        // missed ticks, so each one carries its own occurrence.
+        let occurrenceAt: Date = row.trigger.nextRunAt;
+        let catchUpOccurrences: Date[] = [];
 
         if (!projectPaused && !worktreeSuppressed && row.routine.catchUpPolicy === "enqueue_missed_with_cap") {
           if (isSubHourlyCronExpression(row.trigger.cronExpression, row.trigger.timezone, now)) {
@@ -3259,11 +3523,14 @@ export function routineService(
           } else {
             let cursor: Date | null = row.trigger.nextRunAt;
             runCount = 0;
+            const occurrences: Date[] = [];
             while (cursor && cursor <= now && runCount < MAX_CATCH_UP_RUNS) {
               runCount += 1;
+              occurrences.push(cursor);
               claimedNextRunAt = nextCronTickInTimeZone(row.trigger.cronExpression, row.trigger.timezone, cursor);
               cursor = claimedNextRunAt;
             }
+            catchUpOccurrences = occurrences;
           }
         }
 
@@ -3323,6 +3590,10 @@ export function routineService(
             trigger: row.trigger,
             source: "schedule",
             nextRunAtOverride: claimedNextRunAt,
+            // The tick this dispatch belongs to. Catch-up fires walk several
+            // missed ticks, so the occurrence has to travel with the dispatch
+            // rather than be inferred from the wall clock.
+            occurrenceAt: catchUpOccurrences[i] ?? occurrenceAt,
           });
           triggered += 1;
         }

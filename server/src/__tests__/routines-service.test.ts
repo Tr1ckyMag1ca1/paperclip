@@ -1357,13 +1357,311 @@ describeEmbeddedPostgres("routine service live-execution coalescing", () => {
       responsibleUserId: userId,
     });
 
-    const inboxIssues = await issueSvc.list(companyId, {
+const inboxIssues = await issueSvc.list(companyId, {
       touchedByUserId: userId,
       inboxArchivedByUserId: userId,
       includeRoutineExecutions: true,
     });
     expect(inboxIssues.map((issue) => issue.id)).not.toContain(run.linkedIssueId);
   });
+
+  describe("skip_if_active slot scoping", () => {
+    /**
+     * Builds a routine with two scheduled triggers (a morning and an evening
+     * slot) and parks a live execution issue on the evening one, mimicking the
+     * "previous slot never settled" wrapper that used to suppress every later
+     * fire of the routine.
+     *
+     * The trigger's `nextRunAt` is set so the morning slot is due; the test then
+     * ticks the scheduler, which is the production path.
+     */
+    async function seedTwoTriggerRoutine(opts?: {
+      concurrencyPolicy?: "skip_if_active" | "coalesce_if_active";
+      stale?: boolean;
+      /**
+       * Which slot the parked wrapper belongs to. Defaults to the evening
+       * trigger's 2026-10-24 slot. A reclaim test needs the parked wrapper to
+       * sit in the SAME slot as the dispatch it is about to reclaim.
+       */
+      seededSlot?: { trigger: "evening" | "morning"; occurrence: string };
+    }) {
+      const { companyId, agentId, issueSvc, routine, svc } = await seedFixture();
+      await db
+        .update(routines)
+        .set({ concurrencyPolicy: opts?.concurrencyPolicy ?? "skip_if_active" })
+        .where(eq(routines.id, routine.id));
+
+      const evening = await svc.createTrigger(
+        routine.id,
+        { kind: "schedule", cronExpression: "0 19 * * *", timezone: "America/New_York" },
+        {},
+      );
+      const morning = await svc.createTrigger(
+        routine.id,
+        { kind: "schedule", cronExpression: "0 8 * * *", timezone: "America/New_York" },
+        {},
+      );
+
+      const previousRunId = randomUUID();
+      const liveHeartbeatRunId = randomUUID();
+      const now = new Date();
+      // A stale wrapper has neither the issue nor the run behind it moving
+      // inside the 15 minute staleness window.
+      const ageMs = opts?.stale ? 20 * 60 * 1000 : 0;
+
+      const seeded = opts?.seededSlot ?? { trigger: "evening" as const, occurrence: "2026-10-24T19:00" };
+      const seededTrigger = seeded.trigger === "evening" ? evening.trigger : morning.trigger;
+      const eveningSlotKey = `t:${seededTrigger.id}:${seeded.occurrence}@America/New_York`;
+      const previousIssue = await issueSvc.create(companyId, {
+        projectId: routine.projectId,
+        title: routine.title,
+        description: routine.description,
+        status: "in_progress",
+        priority: routine.priority,
+        assigneeAgentId: routine.assigneeAgentId,
+        originKind: "routine_execution",
+        originId: routine.id,
+        originRunId: previousRunId,
+        originSlotKey: eveningSlotKey,
+        originTriggerId: seededTrigger.id,
+      });
+
+      await db.insert(routineRuns).values({
+        id: previousRunId,
+        companyId,
+        routineId: routine.id,
+        triggerId: seededTrigger.id,
+        source: "schedule",
+        status: "issue_created",
+        triggeredAt: new Date(now.getTime() - ageMs),
+        linkedIssueId: previousIssue.id,
+        slotKey: eveningSlotKey,
+      });
+      await db.insert(heartbeatRuns).values({
+        id: liveHeartbeatRunId,
+        companyId,
+        agentId,
+        invocationSource: "assignment",
+        triggerDetail: "system",
+        status: "running",
+        contextSnapshot: { issueId: previousIssue.id },
+        startedAt: new Date(now.getTime() - ageMs),
+        createdAt: new Date(now.getTime() - ageMs),
+        updatedAt: new Date(now.getTime() - ageMs),
+      });
+      await db
+        .update(issues)
+        .set({
+          checkoutRunId: liveHeartbeatRunId,
+          executionRunId: liveHeartbeatRunId,
+          executionLockedAt: new Date(now.getTime() - ageMs),
+          createdAt: new Date(now.getTime() - ageMs),
+          updatedAt: new Date(now.getTime() - ageMs),
+        })
+        .where(eq(issues.id, previousIssue.id));
+
+      return { companyId, agentId, issueSvc, routine, svc, evening, morning, previousIssue, previousRunId };
+    }
+
+    it("does not let a sibling slot of the same trigger suppress a later slot", async () => {
+      // The evening trigger fired for 2026-10-24 and its wrapper never settled.
+      // The SAME trigger firing again for 2026-10-25 is a different slot and
+      // must not be suppressed either: only an overlap of the same slot is
+      // what skip_if_active is meant to prevent.
+      const { routine, svc, evening, previousIssue } = await seedTwoTriggerRoutine();
+
+      const due = new Date("2026-10-25T23:00:00.000Z");
+      await db.update(routineTriggers).set({ nextRunAt: due }).where(eq(routineTriggers.id, evening.trigger.id));
+
+      expect(await svc.tickScheduledTriggers(due)).toEqual({ triggered: 1 });
+
+      const dispatched = await db
+        .select({ status: routineRuns.status, linkedIssueId: routineRuns.linkedIssueId, slotKey: routineRuns.slotKey })
+        .from(routineRuns)
+        .where(eq(routineRuns.routineId, routine.id))
+        .then((rows) => rows.filter((row) => row.slotKey?.includes("2026-10-25T19:00"))[0] ?? null);
+      expect(dispatched?.status).toBe("issue_created");
+      expect(dispatched?.linkedIssueId).not.toBe(previousIssue.id);
+      expect(dispatched?.slotKey).toBe(`t:${evening.trigger.id}:2026-10-25T19:00@America/New_York`);
+    });
+
+    it("records the reclaim on the run and releases the wedged wrapper", async () => {
+      // The parked wrapper sits in the SAME slot the dispatch is about to take
+      // (morning 2026-10-25) and is stale: it is what the reclaim path exists
+      // for. A wrapper in a different slot is never a reclaim candidate — it is
+      // simply out of the way.
+      const { routine, svc, morning, previousIssue, issueSvc } = await seedTwoTriggerRoutine({
+        stale: true,
+        seededSlot: { trigger: "morning", occurrence: "2026-10-25T08:00" },
+      });
+
+      const due = new Date("2026-10-25T12:00:00.000Z");
+      await db.update(routineTriggers).set({ nextRunAt: due }).where(eq(routineTriggers.id, morning.trigger.id));
+      await svc.tickScheduledTriggers(due);
+
+      const dispatched = await db
+        .select({
+          status: routineRuns.status,
+          linkedIssueId: routineRuns.linkedIssueId,
+          triggerPayload: routineRuns.triggerPayload,
+        })
+        .from(routineRuns)
+        .where(eq(routineRuns.routineId, routine.id))
+        .then((rows) => rows.filter((row) => row.status === "issue_created" && row.linkedIssueId !== previousIssue.id)[0] ?? null);
+      expect(dispatched?.status).toBe("issue_created");
+      const payload = dispatched?.triggerPayload as Record<string, unknown> | null;
+      const reclaim = payload?.reclaim as Record<string, unknown> | undefined;
+      expect(reclaim?.reason).toBe("stale_execution_issue_released");
+      expect(reclaim?.releasedIssueId).toBe(previousIssue.id);
+
+      // The wedged wrapper must have stopped holding the slot: its execution
+      // claim is cleared, so the new execution issue can exist next to it.
+      const released = await db
+        .select({ executionRunId: issues.executionRunId })
+        .from(issues)
+        .where(eq(issues.id, previousIssue.id))
+        .then((rows) => rows[0] ?? null);
+      expect(released?.executionRunId).toBeNull();
+
+      // And the reclaim is visible to whoever reads the wedged wrapper later.
+      const comments = await issueSvc.listComments(previousIssue.id);
+      expect(comments.some((comment) => comment.body.includes("Slot reclaimed"))).toBe(true);
+    });
+
+    it("does not let one trigger's live execution issue suppress another trigger", async () => {
+      const { routine, svc, morning, previousIssue } = await seedTwoTriggerRoutine();
+
+      const due = new Date("2026-10-25T12:00:00.000Z");
+      await db.update(routineTriggers).set({ nextRunAt: due }).where(eq(routineTriggers.id, morning.trigger.id));
+
+      expect(await svc.tickScheduledTriggers(due)).toEqual({ triggered: 1 });
+
+      const runs = await db.select().from(routineRuns).where(eq(routineRuns.routineId, routine.id));
+      const dispatched = runs.find((run) => run.triggerId === morning.trigger.id);
+      expect(dispatched?.status).toBe("issue_created");
+      expect(dispatched?.linkedIssueId).toBeTruthy();
+      expect(dispatched?.linkedIssueId).not.toBe(previousIssue.id);
+
+      const executionIssues = await db
+        .select({ id: issues.id, slotKey: issues.originSlotKey, triggerId: issues.originTriggerId })
+        .from(issues)
+        .where(eq(issues.originId, routine.id));
+      expect(executionIssues).toHaveLength(2);
+      expect(new Set(executionIssues.map((issue) => issue.slotKey)).size).toBe(2);
+      expect(new Set(executionIssues.map((issue) => issue.triggerId)).size).toBe(2);
+    });
+
+    it("records the slot key on the created execution issue and on the run", async () => {
+      const { routine, svc, morning } = await seedTwoTriggerRoutine();
+
+      const due = new Date("2026-10-25T12:00:00.000Z");
+      await db.update(routineTriggers).set({ nextRunAt: due }).where(eq(routineTriggers.id, morning.trigger.id));
+      await svc.tickScheduledTriggers(due);
+
+      const dispatched = await db
+        .select({ slotKey: routineRuns.slotKey, triggerId: routineRuns.triggerId, linkedIssueId: routineRuns.linkedIssueId })
+        .from(routineRuns)
+        .where(eq(routineRuns.routineId, routine.id))
+        .then((rows) => rows.find((row) => row.triggerId === morning.trigger.id) ?? null);
+      expect(dispatched?.triggerId).toBe(morning.trigger.id);
+      // 08:00 America/New_York on 2026-10-25 is 12:00 UTC.
+      expect(dispatched?.slotKey).toBe(`t:${morning.trigger.id}:2026-10-25T08:00@America/New_York`);
+
+      const storedIssue = await db
+        .select({ slotKey: issues.originSlotKey, triggerId: issues.originTriggerId })
+        .from(issues)
+        .where(eq(issues.id, dispatched!.linkedIssueId!))
+        .then((rows) => rows[0] ?? null);
+      expect(storedIssue?.triggerId).toBe(morning.trigger.id);
+      expect(storedIssue?.slotKey).toBe(dispatched?.slotKey);
+    });
+
+    it("still skips when the same slot already has a live execution issue", async () => {
+      const { routine, svc, evening, previousIssue, previousRunId } = await seedTwoTriggerRoutine();
+
+      const due = new Date("2026-10-24T23:00:00.000Z");
+      await db.update(routineTriggers).set({ nextRunAt: due }).where(eq(routineTriggers.id, evening.trigger.id));
+
+      expect(await svc.tickScheduledTriggers(due)).toEqual({ triggered: 1 });
+
+      const dispatched = await db
+        .select({ status: routineRuns.status, linkedIssueId: routineRuns.linkedIssueId, coalescedIntoRunId: routineRuns.coalescedIntoRunId })
+        .from(routineRuns)
+        .where(eq(routineRuns.routineId, routine.id))
+        .then((rows) => rows.find((row) => row.status === "skipped") ?? null);
+      expect(dispatched?.status).toBe("skipped");
+      expect(dispatched?.linkedIssueId).toBe(previousIssue.id);
+      expect(dispatched?.coalescedIntoRunId).toBe(previousRunId);
+    });
+
+    it("reclaims a stale slot instead of skipping it forever", async () => {
+      const { routine, svc, morning, previousIssue } = await seedTwoTriggerRoutine({ stale: true });
+
+      const due = new Date("2026-10-25T12:00:00.000Z");
+      await db.update(routineTriggers).set({ nextRunAt: due }).where(eq(routineTriggers.id, morning.trigger.id));
+
+      expect(await svc.tickScheduledTriggers(due)).toEqual({ triggered: 1 });
+
+      const dispatched = await db
+        .select({ status: routineRuns.status, linkedIssueId: routineRuns.linkedIssueId })
+        .from(routineRuns)
+        .where(eq(routineRuns.routineId, routine.id))
+        .then((rows) => rows.find((row) => row.status !== "issue_created") ?? null);
+      expect(dispatched?.status).not.toBe("skipped");
+      expect(dispatched?.linkedIssueId).not.toBe(previousIssue.id);
+    });
+
+    it("leaves a durable trace when a trigger is skipped", async () => {
+      const { routine, svc, evening, previousIssue } = await seedTwoTriggerRoutine();
+
+      const due = new Date("2026-10-24T23:00:00.000Z");
+      await db.update(routineTriggers).set({ nextRunAt: due }).where(eq(routineTriggers.id, evening.trigger.id));
+      await svc.tickScheduledTriggers(due);
+
+      const skipped = await db
+        .select({
+          status: routineRuns.status,
+          failureReason: routineRuns.failureReason,
+          slotKey: routineRuns.slotKey,
+          triggerPayload: routineRuns.triggerPayload,
+        })
+        .from(routineRuns)
+        .where(eq(routineRuns.routineId, routine.id))
+        .then((rows) => rows.find((row) => row.status === "skipped") ?? null);
+
+      expect(skipped?.status).toBe("skipped");
+      expect(skipped?.slotKey).toBe(`t:${evening.trigger.id}:2026-10-24T19:00@America/New_York`);
+      // A skip is NOT a failure: failure_reason stays empty so "the trigger was
+      // suppressed" stays distinguishable from "the run failed" with a single
+      // query on the run row.
+      expect(skipped?.failureReason).toBeNull();
+      const payload = skipped?.triggerPayload as Record<string, unknown> | null;
+      const skipDetail = payload?.skip as Record<string, unknown> | undefined;
+      expect(skipDetail?.reason).toBe("live_execution_in_slot");
+      expect(skipDetail?.blockingIssueId).toBe(previousIssue.id);
+      expect(skipDetail?.slotKey).toBe(skipped?.slotKey);
+    });
+
+    it("keeps coalesce_if_active scoped to the routine rather than to a slot", async () => {
+      const { routine, svc, morning, previousIssue } = await seedTwoTriggerRoutine({
+        concurrencyPolicy: "coalesce_if_active",
+      });
+
+      const due = new Date("2026-10-25T12:00:00.000Z");
+      await db.update(routineTriggers).set({ nextRunAt: due }).where(eq(routineTriggers.id, morning.trigger.id));
+
+      expect(await svc.tickScheduledTriggers(due)).toEqual({ triggered: 1 });
+
+      const dispatched = await db
+        .select({ status: routineRuns.status, linkedIssueId: routineRuns.linkedIssueId })
+        .from(routineRuns)
+        .where(eq(routineRuns.routineId, routine.id))
+        .then((rows) => rows.find((row) => row.status !== "issue_created") ?? null);
+      expect(dispatched?.status).toBe("coalesced");
+      expect(dispatched?.linkedIssueId).toBe(previousIssue.id);
+    });
+  });
+
 
   it("uses the routine revision responsible-user snapshot for automatic runs", async () => {
     const { companyId, agentId, projectId, svc } = await seedFixture();

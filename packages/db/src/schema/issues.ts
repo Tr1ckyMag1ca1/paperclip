@@ -68,6 +68,14 @@ export const issues = pgTable(
     originIdentityContextId: uuid("origin_identity_context_id"),
     continuationIdentityContextId: uuid("continuation_identity_context_id"),
     originFingerprint: text("origin_fingerprint").notNull().default("default"),
+    // Slot scope for routine execution issues. "origin_slot_key" identifies the
+    // exact schedule slot an execution issue belongs to (trigger + cron
+    // occurrence), so a concurrency guard scoped to one slot cannot let an
+    // unsettled wrapper for another slot suppress a later fire. "origin_trigger_id"
+    // records the trigger on its own so slot-less sources (manual/api/webhook)
+    // still get a per-trigger scope.
+    originSlotKey: text("origin_slot_key"),
+    originTriggerId: text("origin_trigger_id"),
     requestDepth: integer("request_depth").notNull().default(0),
     billingCode: text("billing_code"),
     assigneeAdapterOverrides: jsonb("assignee_adapter_overrides").$type<Record<string, unknown>>(),
@@ -146,8 +154,18 @@ export const issues = pgTable(
     titleSearchIdx: index("issues_title_search_idx").using("gin", table.title.op("gin_trgm_ops")),
     identifierSearchIdx: index("issues_identifier_search_idx").using("gin", table.identifier.op("gin_trgm_ops")),
     descriptionSearchIdx: index("issues_description_search_idx").using("gin", table.description.op("gin_trgm_ops")),
+    // At most one open routine execution issue per (routine, dispatch fingerprint,
+    // slot). The slot column is coalesced so legacy rows without a slot key all
+    // share the 'default' bucket and keep excluding each other, while a scoped
+    // slot row is free to coexist with them.
     openRoutineExecutionIdx: uniqueIndex("issues_open_routine_execution_uq")
-      .on(table.companyId, table.originKind, table.originId, table.originFingerprint)
+      .on(
+        table.companyId,
+        table.originKind,
+        table.originId,
+        table.originFingerprint,
+        sql`coalesce(${table.originSlotKey}, 'default')`,
+      )
       .where(
         sql`${table.originKind} = 'routine_execution'
           and ${table.originId} is not null

@@ -1,4 +1,3 @@
-import { assertOnboardingFirstTaskCreationAllowed } from "./onboarding-first-task-admission.js";
 import { resolveConnectionIntentContinuationSource, resolveItemVerdictContinuationWake } from "./chat-interaction-continuation.js";
 import { insertIssueComment } from "./issue-comment-writes.js";
 import { measureRunTransaction } from "./execution-transaction-timing.js";
@@ -1170,13 +1169,7 @@ export async function resolveChatOriginPublicationBindings(
       .select({
         agentId: heartbeatRuns.agentId,
         responsibleUserId: heartbeatRuns.responsibleUserId,
-        contextSnapshot: sql<Record<string, unknown> | null>`
-          case when jsonb_typeof(${heartbeatRuns.contextSnapshot}) = 'object' then
-            (select coalesce(jsonb_object_agg(entry.key, entry.value), '{}'::jsonb)
-             from jsonb_each(${heartbeatRuns.contextSnapshot}) as entry
-             where entry.key in ('issueId', 'taskId', 'wakeCommentIds', 'wakeCommentId',
-                                 'commentId', 'source', 'sourceRunId', 'interactionId', 'endpointId'))
-          else ${heartbeatRuns.contextSnapshot} end`,
+        contextSnapshot: heartbeatRuns.contextSnapshot,
       })
       .from(heartbeatRuns)
       .where(
@@ -4993,6 +4986,8 @@ const issueListSelect = {
   originIdentityContextId: issues.originIdentityContextId,
   continuationIdentityContextId: issues.continuationIdentityContextId,
   originFingerprint: issues.originFingerprint,
+  originSlotKey: issues.originSlotKey,
+  originTriggerId: issues.originTriggerId,
   requestDepth: issues.requestDepth,
   billingCode: issues.billingCode,
   assigneeAdapterOverrides: issues.assigneeAdapterOverrides,
@@ -10153,12 +10148,6 @@ export function issueService(db: Db) {
           );
           return withRelations;
         }
-
-        await assertOnboardingFirstTaskCreationAllowed(tx as unknown as Db, {
-          companyId,
-          actorAgentId: issueData.createdByAgentId,
-          actorRunId,
-        });
 
         const defaultCompanyGoal = await getDefaultCompanyGoal(tx, companyId);
         let projectWorkspaceId = issueData.projectWorkspaceId ?? null;

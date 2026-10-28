@@ -221,6 +221,13 @@ export interface RoutineRun {
   idempotencyKey: string | null;
   triggerPayload: Record<string, unknown> | null;
   dispatchFingerprint: string | null;
+  /**
+   * The schedule slot this run belongs to: `t:<triggerId>` for sources without
+   * a schedule occurrence, `t:<triggerId>:<occurrence>@<tz>` for scheduled
+   * fires. A skipped run keeps its slot, so "the trigger was suppressed" stays
+   * queryable next to "the run failed" (whose failureReason is set instead).
+   */
+  slotKey: string | null;
   linkedIssueId: string | null;
   coalescedIntoRunId: string | null;
   failureReason: string | null;

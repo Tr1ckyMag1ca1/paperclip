@@ -4996,6 +4996,8 @@ const issueListSelect = {
   originIdentityContextId: issues.originIdentityContextId,
   continuationIdentityContextId: issues.continuationIdentityContextId,
   originFingerprint: issues.originFingerprint,
+  originSlotKey: issues.originSlotKey,
+  originTriggerId: issues.originTriggerId,
   requestDepth: issues.requestDepth,
   billingCode: issues.billingCode,
   assigneeAdapterOverrides: issues.assigneeAdapterOverrides,

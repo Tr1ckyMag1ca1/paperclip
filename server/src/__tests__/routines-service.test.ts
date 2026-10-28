@@ -1574,6 +1574,13 @@ const inboxIssues = await issueSvc.list(companyId, {
         .then((rows) => rows[0] ?? null);
       expect(storedIssue?.triggerId).toBe(morning.trigger.id);
       expect(storedIssue?.slotKey).toBe(dispatched?.slotKey);
+
+      // The slot has to be reachable through the public run API, otherwise the
+      // trace exists only in the database and a skipped trigger is still hard
+      // to tell apart from a failed one by query.
+      const listed = await svc.listRuns(routine.id);
+      const listedRun = listed.find((run) => run.triggerId === morning.trigger.id);
+      expect(listedRun?.slotKey).toBe(dispatched?.slotKey);
     });
 
     it("still skips when the same slot already has a live execution issue", async () => {
